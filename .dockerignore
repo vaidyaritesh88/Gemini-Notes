@@ -1,0 +1,26 @@
+# Secrets — never bake into the image
+.env
+
+# Git history — not needed at runtime
+.git
+.gitignore
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+
+# Local SQLite database — use a mounted volume in production
+synthnotes.db
+
+# Streamlit local cache
+.streamlit/secrets.toml
+
+# OS noise
+.DS_Store
+Thumbs.db

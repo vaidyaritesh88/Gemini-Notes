@@ -1,0 +1,18 @@
+[build]
+builder = "DOCKERFILE"
+
+[deploy]
+# Railway injects $PORT dynamically — pass it through to Streamlit
+startCommand = "streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+# ── Setup required in the Railway dashboard ────────────────────────────────
+# 1. Environment variables → add:
+#      GEMINI_API_KEY   = <your key>
+#      DB_PATH          = /data/synthnotes.db
+# 2. Volumes → create a volume and mount it at path:  /data
+#    This keeps synthnotes.db alive across redeploys.
+# 3. Settings → Networking → Generate Domain  (exposes the app publicly)
+# ──────────────────────────────────────────────────────────────────────────
+

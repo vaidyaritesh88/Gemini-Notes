@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: gemininotes
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    # Render free tier sleeps; upgrade to Starter ($7/mo) to stay always-on
+    plan: starter
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false          # fill in the Render dashboard — never commit secrets
+      - key: DB_PATH
+        value: /data/synthnotes.db
+    # Persistent disk keeps synthnotes.db alive across deploys
+    disk:
+      name: synthnotes-data
+      mountPath: /data
+      sizeGB: 1

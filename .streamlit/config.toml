@@ -1,0 +1,17 @@
+[server]
+# Allow large audio file uploads (up to 200 MB)
+maxUploadSize = 200
+# Required for running behind a reverse proxy (Railway / Render / Fly.io / nginx)
+enableCORS = false
+enableXsrfProtection = false
+headless = true
+
+[theme]
+primaryColor = "#007AFF"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F2F6"
+textColor = "#0F172A"
+font = "system-ui"
+baseFontWeight = 500
+headingFontWeights = [700, 700, 700, 700, 700]
+codeFontWeight = 400

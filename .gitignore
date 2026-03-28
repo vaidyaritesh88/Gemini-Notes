@@ -1,0 +1,17 @@
+# Environment variables / Secrets
+.env
+
+# Python cache/virtual envs (good practice)
+venv/
+*/venv/
+.venv/
+*/.venv/
+__pycache__/
+*.pyc
+
+# Streamlit — commit config.toml (theme/server settings) but not secrets
+.streamlit/secrets.toml
+
+# OS generated files
+.DS_Store
+Thumbs.db
