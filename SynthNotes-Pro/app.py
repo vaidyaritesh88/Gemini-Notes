@@ -455,6 +455,60 @@ USER INSTRUCTION:
 Apply the instruction and return the complete revised summary. Maintain the two-tier structure (## BRIEF and ## DETAILED SUMMARY). Only modify what the instruction asks for. Preserve all factual accuracy."""
 
 
+# ── 4b. ANALYSIS PROMPT ────────────────────────────────────────────────────────
+# The analysis page is the ONLY place where inferences are permitted.
+# Everything here is clearly labelled as AI analysis, not meeting facts.
+
+ANALYSIS_PROMPT = """You are an analyst helping a professional think through the implications of a meeting.
+
+**CONTEXT:**
+- The Intelligence Brief below contains only facts from the meeting — what was actually said.
+- Your job is to analyse those facts and answer the user's question with your own reasoning.
+- Clearly separate facts you are drawing on from the inferences you are making.
+
+**FORMAT YOUR RESPONSE AS FOLLOWS:**
+1. **Facts I am drawing on** (brief — pull the specific points from the brief that are relevant to the question)
+2. **Analysis & Inferences** (your reasoning — clearly marked as your interpretation, not meeting facts)
+3. **Caveats** (what would need to be true for your analysis to hold, or what information is missing)
+
+**IMPORTANT:**
+- Do not present inferences as facts.
+- Use phrases like "This suggests...", "A possible interpretation is...", "One reading of this is..." to signal inference.
+- If the brief does not contain enough information to answer the question well, say so clearly.
+
+---
+INTELLIGENCE BRIEF (facts from the meeting — your source material):
+{intelligence}
+
+---
+QUESTION / ANALYSIS REQUEST:
+{question}
+"""
+
+# Preset questions per meeting type — gives users a useful starting point
+ANALYSIS_PRESETS = {
+    "Expert Meeting": [
+        "What are the key risks to the expert's thesis that they may be underweighting?",
+        "What assumptions is the expert making that are not explicitly stated?",
+        "How does this expert's view differ from a consensus or bullish/bearish market view?",
+        "What follow-up questions would stress-test the expert's position?",
+        "Based on what the expert said, what would need to change for their view to be wrong?",
+    ],
+    "Management Meeting": [
+        "What risks or second-order effects of the decisions made may not have been considered?",
+        "Are there any tensions between the decisions made and the open issues left unresolved?",
+        "What assumptions are embedded in the action items that could cause them to fail?",
+        "Which unresolved issues are most likely to resurface and cause problems?",
+    ],
+    "Internal Discussion": [
+        "What underlying tensions in the disagreements might not have been fully aired?",
+        "What assumptions does the group seem to be making that are not explicitly challenged?",
+        "Are the conclusions reached well-supported by the arguments made in the discussion?",
+        "What is the group not talking about that might be relevant?",
+    ],
+}
+
+
 # ── 5. SAVED PROMPTS HELPERS ──────────────────────────────────────────────────
 
 def load_saved_prompts() -> dict:
@@ -837,12 +891,35 @@ def refine_summary(current_summary: str, intelligence: str, instruction: str, mo
 
 
 def parse_two_tier_summary(text: str) -> Tuple[str, str]:
-    """Split the two-tier output into (brief, detailed_summary)."""
-    brief_match  = re.search(r'##\s*BRIEF\s*\n(.*?)(?=\n##\s*DETAILED SUMMARY|\Z)', text, re.DOTALL | re.IGNORECASE)
-    detail_match = re.search(r'##\s*DETAILED SUMMARY\s*\n(.*?)$', text, re.DOTALL | re.IGNORECASE)
-    brief  = brief_match.group(1).strip()  if brief_match  else ""
-    detail = detail_match.group(1).strip() if detail_match else text.strip()
-    return brief, detail
+    """
+    Split the two-tier output into (brief, detailed_summary).
+
+    Strategy: split on the DETAILED SUMMARY header first (forward-only split),
+    then strip the BRIEF header and any --- separators from the left portion.
+    This is robust against --- dividers, varied capitalisation, and bold markdown
+    on headings (e.g. ## **BRIEF**) that a single-pass regex would miss.
+    """
+    # Split on the DETAILED SUMMARY header — handles ## DETAILED SUMMARY,
+    # ## Detailed Summary, ## **DETAILED SUMMARY**, etc.
+    parts = re.split(
+        r'\n##\s*\**\s*DETAILED\s+SUMMARY\s*\**\s*\n',
+        text, maxsplit=1, flags=re.IGNORECASE
+    )
+
+    if len(parts) == 2:
+        brief_section, detail = parts
+        # Strip the ## BRIEF header (and any bold markers) from the left portion
+        brief = re.sub(
+            r'^.*?##\s*\**\s*BRIEF\s*\**\s*\n+', '', brief_section,
+            flags=re.DOTALL | re.IGNORECASE
+        ).strip()
+        # Strip any leading/trailing --- horizontal rule the model may have added
+        brief = re.sub(r'^-{3,}\s*\n*', '', brief).strip()
+        brief = re.sub(r'\n*-{3,}\s*$', '', brief).strip()
+        return brief, detail.strip()
+
+    # Fallback: model didn't follow the two-tier structure — return full text as detail
+    return "", text.strip()
 
 
 # ── 12. UI HELPERS ─────────────────────────────────────────────────────────────
@@ -1357,13 +1434,153 @@ def page_summary():
                     copy_button(entry["summary"], f"Copy v{entry['version']}")
 
 
-# ── 15. MAIN ───────────────────────────────────────────────────────────────────
+# ── 15. PAGE: ANALYSE ──────────────────────────────────────────────────────────
+
+def run_analysis(intelligence: str, question: str, model, status_write) -> str:
+    """Run a single analysis question against the intelligence brief."""
+    status_write("Analysing…")
+    prompt = ANALYSIS_PROMPT.format(intelligence=intelligence.strip(), question=question.strip())
+    ph = st.empty()
+    resp = generate_with_retry(model, prompt, stream=True)
+    result, _ = stream_and_collect(resp, ph)
+    return result
+
+
+def page_analyse():
+    api_key_check()
+    st.header("Analyse")
+
+    # ── Prominent disclaimer ───────────────────────────────────────────────────
+    st.warning(
+        "**This page produces AI analysis and inferences — not a factual record of the meeting.** "
+        "Responses are the model's interpretation of the meeting content and should be treated as "
+        "analytical input, not as facts. The notes and summary pages contain only what was actually said.",
+        icon="⚠️",
+    )
+
+    with st.sidebar:
+        st.markdown("### Model Settings")
+        analysis_model_name = st.selectbox(
+            "Analysis model", list(MODELS.keys()), index=2,
+            key="analysis_model",
+            help="2.5 Pro gives the most rigorous analytical reasoning."
+        )
+
+    # ── Source ─────────────────────────────────────────────────────────────────
+    has_session = "last_intelligence" in st.session_state
+    source = st.radio(
+        "Intelligence brief source",
+        ["From last processed session", "Paste intelligence brief manually"],
+        horizontal=True, key="analyse_source",
+    )
+
+    intelligence = ""
+    meeting_type = "Expert Meeting"
+
+    if source == "From last processed session":
+        if not has_session:
+            st.info(
+                "No processed session yet. Process a transcript on the **Process Meeting** page first, "
+                "or paste an intelligence brief manually."
+            )
+            return
+        intelligence = st.session_state["last_intelligence"]
+        meeting_type = st.session_state.get("last_meeting_type", "Expert Meeting")
+        st.caption(f"Using intelligence brief from session — **{meeting_type}**")
+        with st.expander("View intelligence brief", expanded=False):
+            render_intelligence_panel(intelligence, meeting_type)
+    else:
+        meeting_type = st.selectbox("Meeting type", MEETING_TYPES, key="analyse_meeting_type")
+        intelligence = st.text_area(
+            "Paste intelligence brief", height=250, key="analyse_intel_input",
+            placeholder="Paste the intelligence brief extracted from the Process Meeting page…"
+        )
+
+    st.divider()
+
+    # ── Preset questions ───────────────────────────────────────────────────────
+    presets = ANALYSIS_PRESETS.get(meeting_type, [])
+    if presets:
+        st.markdown("**Preset analysis questions**")
+        st.caption("Select one to pre-fill the question box, or write your own below.")
+        preset_cols = st.columns(1)
+        selected_preset = st.selectbox(
+            "Choose a preset", ["— write your own —"] + presets,
+            key="preset_question", label_visibility="collapsed"
+        )
+        if ("_last_preset" not in st.session_state or
+                st.session_state["_last_preset"] != selected_preset):
+            if selected_preset != "— write your own —":
+                st.session_state["analysis_question"] = selected_preset
+            st.session_state["_last_preset"] = selected_preset
+
+    # ── Question input ─────────────────────────────────────────────────────────
+    st.markdown("**Your question**")
+    question = st.text_area(
+        "Analysis question", height=100, key="analysis_question",
+        placeholder="e.g. What assumptions is the expert making that are not explicitly stated?"
+    )
+
+    st.divider()
+    if st.button("Run Analysis", type="primary", use_container_width=True):
+        if not intelligence.strip():
+            st.error("Please provide an intelligence brief.")
+            st.stop()
+        if not question.strip():
+            st.error("Please enter a question.")
+            st.stop()
+
+        analysis_model = get_model(analysis_model_name)
+        status_ph = st.empty()
+
+        try:
+            result = run_analysis(intelligence, question, analysis_model,
+                                  lambda msg: status_ph.info(f"⏳ {msg}"))
+            status_ph.empty()
+
+            if not result.strip():
+                raise ValueError("Model returned an empty response.")
+
+            # Store analysis history
+            analyses = st.session_state.setdefault("analysis_history", [])
+            analyses.append({"question": question.strip(), "answer": result.strip()})
+
+        except Exception as e:
+            status_ph.empty()
+            st.error(f"**Error:** {e}")
+
+    # ── Output ─────────────────────────────────────────────────────────────────
+    analyses = st.session_state.get("analysis_history", [])
+    if not analyses:
+        return
+
+    # Show most recent first
+    for i, entry in enumerate(reversed(analyses)):
+        st.divider()
+        entry_num = len(analyses) - i
+        col_q, col_copy = st.columns([4, 1])
+        with col_q:
+            st.markdown(f"**Q{entry_num}: {entry['question']}**")
+        with col_copy:
+            copy_button(entry["answer"], f"Copy A{entry_num}")
+
+        # Render in an amber-tinted container to visually distinguish from factual output
+        st.warning(entry["answer"], icon="🔍")
+
+    if len(analyses) > 1:
+        if st.button("Clear analysis history", key="clear_analyses"):
+            st.session_state.pop("analysis_history", None)
+            st.rerun()
+
+
+# ── 16. MAIN ───────────────────────────────────────────────────────────────────
 
 def main():
     st.set_page_config(page_title="SynthNotes Pro", layout="wide", page_icon="★")
     nav = st.navigation([
         st.Page(page_process, title="Process Meeting", icon=":material/edit_note:"),
         st.Page(page_summary, title="Summary",         icon=":material/summarize:"),
+        st.Page(page_analyse, title="Analyse",         icon=":material/psychology:"),
     ])
     nav.run()
 
