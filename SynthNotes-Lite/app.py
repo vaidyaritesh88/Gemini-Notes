@@ -14,11 +14,13 @@ _api_key = os.environ.get("GEMINI_API_KEY", "")
 if _api_key:
     genai.configure(api_key=_api_key)
 
-CHUNK_WORD_SIZE    = 4000
-CHUNK_WORD_OVERLAP = 400
-MAX_OUTPUT_TOKENS  = 65536
-MAX_PDF_MB         = 25
-MAX_AUDIO_MB       = 200
+CHUNK_WORD_SIZE         = 4000
+CHUNK_WORD_OVERLAP      = 400
+SUMMARY_CHUNK_WORD_SIZE = 3000   # notes are denser than raw transcripts
+SUMMARY_CHUNK_OVERLAP   = 300
+MAX_OUTPUT_TOKENS       = 65536
+MAX_PDF_MB              = 25
+MAX_AUDIO_MB            = 200
 
 MODELS = {
     "Gemini 2.5 Flash (Fast)":      "gemini-2.5-flash",
@@ -211,6 +213,45 @@ Target length: approximately {word_count} words — stay within 10% of this targ
 ---
 MEETING NOTES:
 {notes}
+"""
+
+# Used when notes are too long to summarise in one call — each chunk gets this prompt.
+SUMMARY_CHUNK_PROMPT = """You are extracting the key information from one section of meeting notes.
+Your output will be combined with extracts from other sections to produce a final summary.
+
+### YOUR TASK:
+- Produce a concise but information-dense extract of this section.
+- Preserve ALL: numbers, percentages, names (people, companies, products), decisions, action items, dates, and specific claims.
+- Organise by topic using **bold headings** and bullet points.
+- Do NOT write an introduction or conclusion — this is a middle step, not the final output.
+- Length: aim for roughly 200–400 words regardless of the section length.
+{focus_block}
+---
+NOTES SECTION:
+{chunk_text}
+"""
+
+# Final consolidation prompt — takes all chunk extracts and produces the polished summary.
+SUMMARY_SYNTHESISE_PROMPT = """You are producing the final summary from a set of section extracts taken from a longer set of meeting notes.
+
+Target length: approximately {word_count} words — stay within 10% of this target.
+
+### STRUCTURE:
+1. **Meeting Overview** (1–2 sentences): Briefly state what kind of meeting this was and the main subject discussed.
+2. **Main Themes** (the bulk of your summary): For each major topic discussed, use a **bold heading** for the theme, then bullet points (- ) for the key findings, conclusions, and data points under that theme.
+3. **Key Takeaways**: End with a **Key Takeaways** section containing 3–5 concise bullets — the most important things to remember from this meeting.
+
+### RULES:
+- Hit the target word count: not significantly shorter, not significantly longer.
+- Consolidate information across sections — do NOT repeat the same point under multiple headings.
+- Keep all critical data: numbers, percentages, names of people/companies, specific claims, dates.
+- Do NOT add information that is not present in the extracts.
+- Language: direct and professional. Avoid filler phrases.
+- Each bullet should make one clear, complete, self-contained point.
+{focus_block}
+---
+SECTION EXTRACTS:
+{extracts}
 """
 
 
@@ -768,6 +809,70 @@ def page_generate():
         st.info("Go to the **Summary** tab to generate a summary from these notes.", icon="ℹ️")
 
 
+def summarise_in_chunks(notes: str, word_count: int, focus_block: str, model, status_write) -> str:
+    """
+    Summarise notes that may be too long to handle in a single API call.
+
+    Pipeline:
+      1. If the notes fit in one chunk → use SUMMARY_PROMPT directly (streaming).
+      2. Otherwise:
+         a. Split into overlapping chunks (SUMMARY_CHUNK_WORD_SIZE / SUMMARY_CHUNK_OVERLAP).
+         b. Generate a key-facts extract for each chunk in parallel (up to 3 workers).
+         c. Synthesise all extracts into one final summary via SUMMARY_SYNTHESISE_PROMPT.
+    """
+    chunks = create_chunks_with_overlap(notes, SUMMARY_CHUNK_WORD_SIZE, SUMMARY_CHUNK_OVERLAP)
+
+    # ── Single-chunk fast path ──────────────────────────────────────────────
+    if len(chunks) == 1:
+        status_write(f"Generating ~{word_count}-word summary…")
+        prompt = SUMMARY_PROMPT.format(
+            word_count=word_count,
+            focus_block=focus_block,
+            notes=notes.strip(),
+        )
+        ph = st.empty()
+        resp = generate_with_retry(model, prompt, stream=True)
+        summary, _ = stream_and_collect(resp, ph)
+        return summary
+
+    # ── Multi-chunk pipeline ────────────────────────────────────────────────
+    total = len(chunks)
+    status_write(f"Notes are long — splitting into {total} sections for parallel extraction…")
+
+    extracts: list[str] = [""] * total
+
+    def _extract_one(idx: int, chunk_text: str) -> tuple[int, str]:
+        prompt = SUMMARY_CHUNK_PROMPT.format(
+            focus_block=focus_block,
+            chunk_text=chunk_text,
+        )
+        return idx, generate_with_retry(model, prompt).text
+
+    with ThreadPoolExecutor(max_workers=min(3, total)) as executor:
+        futures = {executor.submit(_extract_one, i, c): i for i, c in enumerate(chunks)}
+        done = 0
+        for fut in as_completed(futures):
+            idx, text = fut.result()
+            extracts[idx] = text
+            done += 1
+            status_write(f"Extracted section {done}/{total}…")
+
+    # ── Synthesis pass ──────────────────────────────────────────────────────
+    status_write(f"Synthesising {total} extracts into ~{word_count}-word summary…")
+    combined = "\n\n---\n\n".join(
+        f"**[Section {i+1}/{total}]**\n{e}" for i, e in enumerate(extracts)
+    )
+    synth_prompt = SUMMARY_SYNTHESISE_PROMPT.format(
+        word_count=word_count,
+        focus_block=focus_block,
+        extracts=combined,
+    )
+    ph = st.empty()
+    resp = generate_with_retry(model, synth_prompt, stream=True)
+    summary, _ = stream_and_collect(resp, ph)
+    return summary
+
+
 # ── 6. PAGE: SUMMARY ───────────────────────────────────────────────────────────
 
 def page_summary():
@@ -804,7 +909,7 @@ def page_summary():
     word_count = SUMMARY_PRESETS[length_label]
     if word_count is None:
         word_count = st.number_input(
-            "Custom word count", min_value=50, max_value=2000, value=400, step=50, key="custom_wc"
+            "Custom word count", min_value=50, value=400, step=50, key="custom_wc"
         )
 
     # ── Focus instructions + saved prompts ─────────────────────────────────────
@@ -946,22 +1051,26 @@ def page_summary():
             focus_block = ""
 
         model = get_model(summary_model_name)
-        prompt = SUMMARY_PROMPT.format(
-            word_count=word_count,
-            focus_block=focus_block,
-            notes=notes_input.strip(),
-        )
 
-        with st.spinner(f"Generating ~{word_count}-word summary..."):
-            try:
-                ph = st.empty()
-                resp = generate_with_retry(model, prompt, stream=True)
-                summary, _ = stream_and_collect(resp, ph)
-                if not summary.strip():
-                    raise ValueError("Model returned an empty response.")
-                st.session_state["last_summary"] = summary
-            except Exception as e:
-                st.error(f"**Error:** {e}")
+        status_ph = st.empty()
+        def _status(msg: str):
+            status_ph.info(f"⏳ {msg}")
+
+        try:
+            summary = summarise_in_chunks(
+                notes=notes_input.strip(),
+                word_count=word_count,
+                focus_block=focus_block,
+                model=model,
+                status_write=_status,
+            )
+            status_ph.empty()
+            if not summary.strip():
+                raise ValueError("Model returned an empty response.")
+            st.session_state["last_summary"] = summary
+        except Exception as e:
+            status_ph.empty()
+            st.error(f"**Error:** {e}")
 
     # ── Output ─────────────────────────────────────────────────────────────────
     if "last_summary" in st.session_state:
