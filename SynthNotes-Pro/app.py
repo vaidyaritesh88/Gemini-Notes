@@ -485,28 +485,24 @@ QUESTION / ANALYSIS REQUEST:
 {question}
 """
 
-# Preset questions per meeting type — gives users a useful starting point
-ANALYSIS_PRESETS = {
-    "Expert Meeting": [
-        "What are the key risks to the expert's thesis that they may be underweighting?",
-        "What assumptions is the expert making that are not explicitly stated?",
-        "How does this expert's view differ from a consensus or bullish/bearish market view?",
-        "What follow-up questions would stress-test the expert's position?",
-        "Based on what the expert said, what would need to change for their view to be wrong?",
-    ],
-    "Management Meeting": [
-        "What risks or second-order effects of the decisions made may not have been considered?",
-        "Are there any tensions between the decisions made and the open issues left unresolved?",
-        "What assumptions are embedded in the action items that could cause them to fail?",
-        "Which unresolved issues are most likely to resurface and cause problems?",
-    ],
-    "Internal Discussion": [
-        "What underlying tensions in the disagreements might not have been fully aired?",
-        "What assumptions does the group seem to be making that are not explicitly challenged?",
-        "Are the conclusions reached well-supported by the arguments made in the discussion?",
-        "What is the group not talking about that might be relevant?",
-    ],
-}
+QUESTION_SUGGESTION_PROMPT = """You are helping a professional analyst decide what to analyse from a meeting.
+
+Read the intelligence brief below and suggest 5 analysis questions that would be genuinely useful to explore.
+
+**RULES FOR GOOD QUESTIONS:**
+- Questions must be specific to the content of THIS brief — not generic questions that could apply to any meeting.
+- Each question should require reasoning BEYOND what is directly stated in the brief (otherwise it can just be read, not analysed).
+- Questions should surface something that a thoughtful analyst would want to think through — hidden assumptions, unstated risks, tensions between views, what the data implies, what is missing.
+- Do NOT ask questions that are already directly answered in the brief.
+- Do NOT ask generic questions like "What are the risks?" — make them specific to what this expert actually said.
+
+**OUTPUT FORMAT:**
+Return exactly 5 questions, one per line, numbered 1–5. No preamble, no explanation — just the questions.
+
+---
+INTELLIGENCE BRIEF:
+{intelligence}
+"""
 
 
 # ── 5. SAVED PROMPTS HELPERS ──────────────────────────────────────────────────
@@ -1498,27 +1494,54 @@ def page_analyse():
 
     st.divider()
 
-    # ── Preset questions ───────────────────────────────────────────────────────
-    presets = ANALYSIS_PRESETS.get(meeting_type, [])
-    if presets:
-        st.markdown("**Preset analysis questions**")
-        st.caption("Select one to pre-fill the question box, or write your own below.")
-        preset_cols = st.columns(1)
-        selected_preset = st.selectbox(
-            "Choose a preset", ["— write your own —"] + presets,
-            key="preset_question", label_visibility="collapsed"
+    # ── Suggested questions (generated dynamically from the brief) ─────────────
+    st.markdown("**Suggested questions for this call**")
+    st.caption(
+        "Questions are generated from the content of this specific brief — not generic templates. "
+        "Click any question to load it into the box below."
+    )
+
+    col_suggest, _ = st.columns([1, 3])
+    with col_suggest:
+        suggest_clicked = st.button(
+            "✦ Suggest questions", key="btn_suggest",
+            help="Generates 5 analysis questions specific to this call's content."
         )
-        if ("_last_preset" not in st.session_state or
-                st.session_state["_last_preset"] != selected_preset):
-            if selected_preset != "— write your own —":
-                st.session_state["analysis_question"] = selected_preset
-            st.session_state["_last_preset"] = selected_preset
+
+    if suggest_clicked:
+        if not intelligence.strip():
+            st.error("Please provide an intelligence brief first.")
+        else:
+            analysis_model = get_model(analysis_model_name)
+            with st.spinner("Generating questions for this call…"):
+                try:
+                    raw = generate_with_retry(
+                        analysis_model,
+                        QUESTION_SUGGESTION_PROMPT.format(intelligence=intelligence.strip())
+                    ).text
+                    # Parse numbered lines into a clean list
+                    questions = [
+                        re.sub(r'^\s*\d+[\.\)]\s*', '', line).strip()
+                        for line in raw.strip().splitlines()
+                        if re.match(r'^\s*\d+[\.\)]', line)
+                    ]
+                    st.session_state["suggested_questions"] = questions[:5]
+                except Exception as e:
+                    st.error(f"Could not generate suggestions: {e}")
+
+    # Render suggested questions as clickable buttons
+    suggested = st.session_state.get("suggested_questions", [])
+    if suggested:
+        for q in suggested:
+            if st.button(f"↳ {q}", key=f"sq_{hash(q)}", use_container_width=True):
+                st.session_state["analysis_question"] = q
+                st.rerun()
 
     # ── Question input ─────────────────────────────────────────────────────────
     st.markdown("**Your question**")
     question = st.text_area(
         "Analysis question", height=100, key="analysis_question",
-        placeholder="e.g. What assumptions is the expert making that are not explicitly stated?"
+        placeholder="Click a suggested question above, or type your own…"
     )
 
     st.divider()
