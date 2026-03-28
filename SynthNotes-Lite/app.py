@@ -1,11 +1,10 @@
 import streamlit as st
 import google.generativeai as genai
-import os, io, re, time, tempfile, json, html as html_module
+import os, io, re, time, tempfile, json, html as html_module, subprocess, glob
 from typing import Optional, Tuple, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 import PyPDF2
-from pydub import AudioSegment
 import streamlit.components.v1 as components
 
 # ── 1. CONFIG ──────────────────────────────────────────────────────────────────
@@ -362,17 +361,15 @@ def extract_pdf_text(file_bytes: bytes) -> str:
     return "\n".join(pages)
 
 
-def transcribe_audio(audio_bytes: bytes, model, status_write, context: str = "") -> str:
-    """Split audio into 5-min chunks, upload to Gemini Files API, transcribe, clean up.
+def transcribe_audio(audio_bytes: bytes, model, status_write, context: str = "", file_ext: str = ".audio") -> str:
+    """Split audio into 5-min WAV chunks using FFmpeg, upload to Gemini Files API, transcribe.
 
-    context: optional domain context (speaker names, subject matter, terminology)
-             that helps the model produce more accurate transcriptions.
+    Uses FFmpeg (installed via packages.txt) instead of pydub, so it works on any Python version
+    and handles every audio format FFmpeg supports (WAV, MP3, M4A, OGG, FLAC, WebM, etc.).
+
+    context:  optional domain context to improve transcription accuracy
+    file_ext: original file extension hint (e.g. ".mp3", ".webm") — helps FFmpeg probe the format
     """
-    audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
-    chunk_ms = 5 * 60 * 1000
-    audio_chunks = [audio[i : i + chunk_ms] for i in range(0, len(audio), chunk_ms)]
-
-    # Build the transcription instruction — enriched with user context when provided
     transcription_instruction = "Transcribe this audio accurately, preserving the speaker's words as closely as possible."
     if context.strip():
         transcription_instruction += (
@@ -380,24 +377,54 @@ def transcribe_audio(audio_bytes: bytes, model, status_write, context: str = "")
             f"(use this to correctly identify domain-specific terms, names, and abbreviations):\n{context.strip()}"
         )
 
-    transcripts, cloud_names, local_paths = [], [], []
-    try:
-        for i, chunk in enumerate(audio_chunks):
-            status_write(f"Transcribing audio chunk {i+1} of {len(audio_chunks)}...")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
-                chunk.export(f.name, format="wav")
-                local_paths.append(f.name)
+    local_paths, cloud_names, transcripts = [], [], []
 
-            cloud = genai.upload_file(path=local_paths[-1])
+    # Write the full audio bytes to a temp file so FFmpeg can read it
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as f:
+        f.write(audio_bytes)
+        input_path = f.name
+    local_paths.append(input_path)
+
+    try:
+        # Use FFmpeg to split into 5-minute mono 16kHz WAV chunks.
+        # -f segment + -segment_time 300 splits at silence-friendly boundaries.
+        chunk_pattern = input_path + "_chunk_%03d.wav"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", input_path,
+                "-f", "segment", "-segment_time", "300",
+                "-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                chunk_pattern,
+            ],
+            capture_output=True, timeout=300,
+        )
+
+        chunk_files = sorted(glob.glob(input_path + "_chunk_*.wav"))
+        local_paths.extend(chunk_files)
+
+        # If FFmpeg didn't produce chunks (very short recording), convert the whole file instead
+        if not chunk_files:
+            converted_path = input_path + "_full.wav"
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", input_path,
+                 "-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1", converted_path],
+                capture_output=True, timeout=120,
+            )
+            local_paths.append(converted_path)
+            chunk_files = [converted_path]
+
+        for i, chunk_path in enumerate(chunk_files):
+            status_write(f"Transcribing audio chunk {i+1} of {len(chunk_files)}...")
+            cloud = genai.upload_file(path=chunk_path)
             cloud_names.append(cloud.name)
             while cloud.state.name == "PROCESSING":
                 time.sleep(2)
                 cloud = genai.get_file(cloud.name)
             if cloud.state.name != "ACTIVE":
                 raise RuntimeError(f"Audio chunk {i+1} failed to process in the cloud.")
-
             resp = generate_with_retry(model, [transcription_instruction, cloud])
             transcripts.append(resp.text)
+
     finally:
         for p in local_paths:
             try: os.remove(p)
@@ -640,6 +667,7 @@ def page_generate():
 
     raw_text: Optional[str] = None
     audio_bytes: Optional[bytes] = None
+    audio_ext: str = ".audio"
     is_audio = False
 
     if input_method == "Paste Text":
@@ -661,6 +689,7 @@ def page_generate():
                 else:
                     is_audio = True
                     audio_bytes = uploaded.getvalue()
+                    audio_ext = ext
                     st.info(f"Audio loaded: **{uploaded.name}** ({size_mb:.1f} MB)")
             elif ext == ".pdf":
                 if size_mb > MAX_PDF_MB:
@@ -680,9 +709,9 @@ def page_generate():
         recording = st.audio_input("Record a voice note", key="audio_recording")
         if recording:
             audio_bytes = recording.getvalue()
-            duration_s = len(audio_bytes) / (2 * 16000)  # rough estimate: 16-bit mono 16kHz
+            audio_ext = ".webm"   # browsers record in WebM/Opus
             is_audio = True
-            st.success(f"Recording captured (~{duration_s:.0f}s). Click **Generate Notes** when ready.")
+            st.success("Recording captured. Click **Generate Notes** when ready.")
 
     # Generate button
     st.divider()
@@ -700,7 +729,7 @@ def page_generate():
             try:
                 # Step 1: audio → raw transcript
                 if is_audio:
-                    transcript = transcribe_audio(audio_bytes, transcr_model, st.write, context=extra_context_combined)
+                    transcript = transcribe_audio(audio_bytes, transcr_model, st.write, context=extra_context_combined, file_ext=audio_ext)
                     st.write(f"✓ Transcription complete: **{len(transcript.split()):,} words**")
                 else:
                     transcript = re.sub(r"\n{3,}", "\n\n", raw_text.strip())
