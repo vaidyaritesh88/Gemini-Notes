@@ -330,12 +330,20 @@ SUMMARY_EXPERT_PROMPT = """You are writing a factual summary of an expert consul
 
 **CRITICAL RULE: Only include information that appears in the intelligence brief below. Do not add your own analysis, inferences, or interpretations. If something is not in the brief, do not include it.**
 
+**LANGUAGE RULES — read carefully before writing:**
+- Write in plain, neutral, declarative sentences. No rhetorical flourishes.
+- Do NOT use evaluative words you are adding yourself — words like "notably", "importantly", "significantly", "strikingly", "key", "critical", "impressive", "concerning", "surprisingly" — unless the brief itself uses them. These words frame importance; that is the reader's job, not yours.
+- Do NOT add connective language ("however", "despite", "yet", "although", "this contrasts with") to imply a tension or relationship unless the brief explicitly records that contrast or tension. Only use a causal connector ("because", "as a result") if the brief states the causal link.
+- Do NOT use words that subtly talk up or talk down a point: "only", "merely", "just", "even", "still" (when used for rhetorical effect), "despite only", "managed to", "failed to".
+- Quotes should appear exactly as they are in the brief — do not paraphrase into reported speech that softens or sharpens the original.
+- The goal is a transcript-faithful account. Coherence comes from grouping related facts together, not from editorial framing.
+
 Target: approximately {word_count} words for the Detailed Summary. The Brief should be ~150 words.
 {focus_block}
 ---
 
 ## BRIEF
-[~150 words. A concise factual overview: who the expert is (if background is in the brief), the main subject of the call, and the expert's core position. Flowing prose, no headers or bullets. Written so it stands alone as a quick reference.]
+[~150 words. A concise factual overview: who the expert is (if background is in the brief), the main subject of the call, and the expert's core position. Plain prose, no headers or bullets. Written so it stands alone as a quick reference. Apply the language rules above — no evaluative framing.]
 
 ---
 
@@ -345,12 +353,12 @@ Target: approximately {word_count} words for the Detailed Summary. The Brief sho
 
 Step 1 — Identify the main topics discussed in this call from the intelligence brief. Let the topics emerge from the content — do not force it into a pre-defined skeleton. A typical call has 3–6 main topics.
 
-Step 2 — For each topic, write a **bold topic heading** followed by 2–4 sentences of coherent prose. The prose should:
-- Read as a narrative account, not a list of facts
-- Weave data points, specific numbers, and company names in naturally, as part of sentences rather than as standalone bullets
-- Include a direct quote from the brief inline if one is relevant to this topic (format: *"quote"*)
-- Connect related facts with language like "because", "however", "this contrasts with", "the expert noted that... and attributed this to..."
-- Capture the expert's stated confidence level or caveats where relevant ("he was confident that...", "she cautioned that...")
+Step 2 — For each topic, write a **bold topic heading** followed by 2–4 sentences of factual prose. The prose should:
+- Group related facts from the brief into sentences rather than presenting each fact as an isolated bullet
+- Weave data points, specific numbers, and company names in as part of sentences
+- Include a direct quote from the brief inline if one is relevant to this topic (format: *"quote"*) — use the exact wording from the brief
+- Only use connective language where the brief records the relationship (e.g. do not write "however" to imply a contrast the brief does not state)
+- Capture the expert's stated confidence level or caveats using the expert's own phrasing where possible
 
 Step 3 — If a topic has more than 3–4 distinct data points that are hard to weave into prose without cluttering it, follow the prose with a compact indented list of those specifics only.
 
@@ -369,12 +377,19 @@ SUMMARY_MANAGEMENT_PROMPT = """You are writing a factual summary of a management
 
 **CRITICAL RULE: Only include information from the intelligence brief below. Do not add your own analysis or inferences.**
 
+**LANGUAGE RULES — read carefully before writing:**
+- Write in plain, neutral, declarative sentences. No rhetorical flourishes.
+- Do NOT use evaluative words you are adding yourself — words like "notably", "importantly", "significantly", "key", "critical", "concerning" — unless the brief itself uses them.
+- Do NOT add connective language ("however", "despite", "yet", "this contrasts with") to imply a tension or relationship unless the brief explicitly records it. Only use a causal connector ("because", "as a result", "leading to") if the brief states the causal link.
+- Do NOT use words that subtly talk up or talk down a point: "only", "merely", "just", "even", "still" (used rhetorically), "managed to", "failed to".
+- The goal is a transcript-faithful account. Coherence comes from grouping related facts together, not from editorial framing.
+
 Target: approximately {word_count} words for the Detailed Summary. The Brief should be ~100 words.
 {focus_block}
 ---
 
 ## BRIEF
-[~100 words. Flowing prose that states the meeting's purpose, the key decisions reached, and the most critical actions arising — all drawn strictly from the brief. No headers or bullet points. Should read as a forwardable paragraph.]
+[~100 words. Plain prose that states the meeting's purpose, the decisions reached, and the actions arising — all drawn strictly from the brief. No headers or bullet points. Apply the language rules above — no evaluative framing.]
 
 ---
 
@@ -384,12 +399,12 @@ Target: approximately {word_count} words for the Detailed Summary. The Brief sho
 
 Step 1 — Identify the main topics discussed in this meeting from the intelligence brief. Let the topics emerge from the content — do not force it into a pre-defined skeleton. A typical management meeting has 3–6 main topics (e.g. a strategic decision, a budget discussion, a delivery issue).
 
-Step 2 — For each topic, write a **bold topic heading** followed by 2–4 sentences of coherent prose. The prose should:
-- Read as a narrative account, not a list of facts
-- Weave in specific numbers, owners, and deadlines naturally
-- Include a direct quote from the brief inline if relevant (format: *"quote"*)
-- Connect related points with language like "because", "however", "leading to"
-- Capture any stated rationale for decisions
+Step 2 — For each topic, write a **bold topic heading** followed by 2–4 sentences of factual prose. The prose should:
+- Group related facts from the brief into sentences rather than presenting each as an isolated bullet
+- Weave in specific numbers, owners, and deadlines as part of sentences
+- Include a direct quote from the brief inline if relevant (format: *"quote"*) — use the exact wording from the brief
+- Only use connective language where the brief records the relationship
+- Capture stated rationale for decisions using the phrasing in the brief, not your own framing
 
 Step 3 — If a topic has more than 3–4 distinct data points that would clutter prose, follow the prose with a compact indented list of those specifics only.
 
@@ -416,12 +431,19 @@ SUMMARY_INTERNAL_PROMPT = """You are writing a factual summary of an internal te
 
 **CRITICAL RULE: Only include information from the intelligence brief below. Do not add your own analysis or inferences.**
 
+**LANGUAGE RULES — read carefully before writing:**
+- Write in plain, neutral, declarative sentences. No rhetorical flourishes.
+- Do NOT use evaluative words you are adding yourself — words like "notably", "importantly", "significantly", "key", "critical", "concerning" — unless the brief itself uses them.
+- Do NOT add connective language ("however", "despite", "yet", "this contrasts with") to imply a tension or relationship unless the brief explicitly records it. Only use a causal connector ("because", "as a result", "this led to") if the brief states the causal link.
+- Do NOT use words that subtly talk up or talk down a point: "only", "merely", "just", "even", "still" (used rhetorically), "managed to", "failed to".
+- The goal is a transcript-faithful account. Coherence comes from grouping related facts together, not from editorial framing.
+
 Target: approximately {word_count} words for the Detailed Summary. The Brief should be ~100 words.
 {focus_block}
 ---
 
 ## BRIEF
-[~100 words. Flowing prose that states what the discussion was about, the key conclusion reached, and the most important next step — all drawn strictly from the brief. No headers or bullet points. Should read as a forwardable paragraph.]
+[~100 words. Plain prose that states what the discussion was about, the conclusion reached, and the most important next step — all drawn strictly from the brief. No headers or bullet points. Apply the language rules above — no evaluative framing.]
 
 ---
 
@@ -431,12 +453,12 @@ Target: approximately {word_count} words for the Detailed Summary. The Brief sho
 
 Step 1 — Identify the main topics discussed in this meeting from the intelligence brief. Let the topics emerge from the content — do not force it into a pre-defined skeleton. A typical internal discussion has 3–5 main topics (e.g. a problem being diagnosed, a proposal being evaluated, a process being debated).
 
-Step 2 — For each topic, write a **bold topic heading** followed by 2–4 sentences of coherent prose. The prose should:
-- Read as a narrative account of how the discussion unfolded, not a list of points
-- Capture who said what only where the brief records attribution
-- Include a direct quote from the brief inline if relevant (format: *"quote"*)
-- Note where there was agreement or disagreement naturally within the prose — avoid separate Agreement/Disagreement sections unless the split is the whole story of that topic
-- Connect related points with language like "because", "however", "this led to"
+Step 2 — For each topic, write a **bold topic heading** followed by 2–4 sentences of factual prose. The prose should:
+- Group related facts from the brief into sentences rather than presenting each as an isolated bullet
+- Capture who said what only where the brief records attribution — do not attribute views not attributed in the brief
+- Include a direct quote from the brief inline if relevant (format: *"quote"*) — use the exact wording from the brief
+- Record agreement or disagreement only where the brief records it, using neutral phrasing ("X and Y agreed that...", "X held that..., while Y held that...")
+- Only use connective language where the brief records the relationship
 
 Step 3 — If a topic has more than 3–4 distinct data points that would clutter prose, follow the prose with a compact indented list of those specifics only.
 
@@ -466,7 +488,9 @@ INTELLIGENCE BRIEF (source of truth — do not add anything not present here):
 USER INSTRUCTION:
 {instruction}
 
-Apply the instruction and return the complete revised summary. Maintain the two-tier structure (## BRIEF and ## DETAILED SUMMARY). Only modify what the instruction asks for. Preserve all factual accuracy."""
+Apply the instruction and return the complete revised summary. Maintain the two-tier structure (## BRIEF and ## DETAILED SUMMARY). Only modify what the instruction asks for. Preserve all factual accuracy.
+
+**LANGUAGE RULES (apply throughout):** Plain, neutral, declarative sentences. No evaluative words ("notably", "importantly", "significantly", "concerning") unless they appear in the intelligence brief. No connective language that implies a relationship the brief does not state. No words that talk up or talk down a point ("only", "merely", "managed to", "failed to") used rhetorically."""
 
 
 # ── 4b. ANALYSIS PROMPT ────────────────────────────────────────────────────────
