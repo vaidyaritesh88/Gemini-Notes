@@ -485,6 +485,23 @@ QUESTION / ANALYSIS REQUEST:
 {question}
 """
 
+NOTES_QA_PROMPT = """You are helping a professional get answers from their meeting notes.
+
+The notes below are a factual record of what was said.
+
+**HOW TO RESPOND:**
+- If the question is factual ("What did the expert say about X?", "What was decided on Y?"): answer directly from the notes, quoting or closely paraphrasing the relevant section. Clearly state where in the notes the answer comes from.
+- If the question is analytical ("What are the implications of X?", "What assumptions is the expert making?"): first state the relevant facts from the notes, then clearly label your own analysis using phrases like "This suggests..." or "A possible interpretation is...".
+- If the answer is not in the notes: say so clearly — do not fabricate or fill gaps.
+
+MEETING NOTES:
+{notes}
+
+---
+QUESTION:
+{question}
+"""
+
 QUESTION_SUGGESTION_PROMPT = """You are helping a professional analyst decide what to analyse from a meeting.
 
 Read the intelligence brief below and suggest 5 analysis questions that would be genuinely useful to explore.
@@ -1463,21 +1480,27 @@ def page_analyse():
         )
 
     # ── Source ─────────────────────────────────────────────────────────────────
+    # Three modes:
+    #   Session  — uses pre-extracted intelligence brief (fastest, no extra step)
+    #   Notes    — paste raw notes; answers come directly from the notes
+    #   Brief    — paste a previously extracted intelligence brief
     has_session = "last_intelligence" in st.session_state
     source = st.radio(
-        "Intelligence brief source",
-        ["From last processed session", "Paste intelligence brief manually"],
+        "Source",
+        ["From last processed session", "Paste notes", "Paste intelligence brief"],
         horizontal=True, key="analyse_source",
     )
 
-    intelligence = ""
+    intelligence = ""    # used for session / brief modes
+    raw_notes    = ""    # used for notes mode
     meeting_type = "Expert Meeting"
+    using_notes  = (source == "Paste notes")
 
     if source == "From last processed session":
         if not has_session:
             st.info(
                 "No processed session yet. Process a transcript on the **Process Meeting** page first, "
-                "or paste an intelligence brief manually."
+                "or paste your notes directly."
             )
             return
         intelligence = st.session_state["last_intelligence"]
@@ -1485,41 +1508,48 @@ def page_analyse():
         st.caption(f"Using intelligence brief from session — **{meeting_type}**")
         with st.expander("View intelligence brief", expanded=False):
             render_intelligence_panel(intelligence, meeting_type)
-    else:
+
+    elif source == "Paste notes":
+        raw_notes = st.text_area(
+            "Paste meeting notes", height=250, key="analyse_notes_input",
+            placeholder="Paste your meeting notes here — ask any question about them below."
+        )
+        st.caption("You can ask factual questions (*'What did the expert say about X?'*) or analytical ones (*'What does the view on X imply?'*).")
+
+    else:  # Paste intelligence brief
         meeting_type = st.selectbox("Meeting type", MEETING_TYPES, key="analyse_meeting_type")
         intelligence = st.text_area(
             "Paste intelligence brief", height=250, key="analyse_intel_input",
             placeholder="Paste the intelligence brief extracted from the Process Meeting page…"
         )
 
+    # The active content for suggestion generation — brief if available, notes otherwise
+    suggestion_source = intelligence.strip() or raw_notes.strip()
+
     st.divider()
 
-    # ── Suggested questions (generated dynamically from the brief) ─────────────
+    # ── Suggested questions ────────────────────────────────────────────────────
     st.markdown("**Suggested questions for this call**")
-    st.caption(
-        "Questions are generated from the content of this specific brief — not generic templates. "
-        "Click any question to load it into the box below."
-    )
+    st.caption("Generated from the content of this specific meeting — not generic templates.")
 
     col_suggest, _ = st.columns([1, 3])
     with col_suggest:
         suggest_clicked = st.button(
             "✦ Suggest questions", key="btn_suggest",
-            help="Generates 5 analysis questions specific to this call's content."
+            help="Generates 5 questions specific to this call's content."
         )
 
     if suggest_clicked:
-        if not intelligence.strip():
-            st.error("Please provide an intelligence brief first.")
+        if not suggestion_source:
+            st.error("Please provide notes or a brief first.")
         else:
             analysis_model = get_model(analysis_model_name)
             with st.spinner("Generating questions for this call…"):
                 try:
                     raw = generate_with_retry(
                         analysis_model,
-                        QUESTION_SUGGESTION_PROMPT.format(intelligence=intelligence.strip())
+                        QUESTION_SUGGESTION_PROMPT.format(intelligence=suggestion_source)
                     ).text
-                    # Parse numbered lines into a clean list
                     questions = [
                         re.sub(r'^\s*\d+[\.\)]\s*', '', line).strip()
                         for line in raw.strip().splitlines()
@@ -1529,7 +1559,6 @@ def page_analyse():
                 except Exception as e:
                     st.error(f"Could not generate suggestions: {e}")
 
-    # Render suggested questions as clickable buttons
     suggested = st.session_state.get("suggested_questions", [])
     if suggested:
         for q in suggested:
@@ -1540,14 +1569,15 @@ def page_analyse():
     # ── Question input ─────────────────────────────────────────────────────────
     st.markdown("**Your question**")
     question = st.text_area(
-        "Analysis question", height=100, key="analysis_question",
+        "Question", height=100, key="analysis_question",
         placeholder="Click a suggested question above, or type your own…"
     )
 
     st.divider()
     if st.button("Run Analysis", type="primary", use_container_width=True):
-        if not intelligence.strip():
-            st.error("Please provide an intelligence brief.")
+        active_content = raw_notes.strip() if using_notes else intelligence.strip()
+        if not active_content:
+            st.error("Please paste notes or an intelligence brief.")
             st.stop()
         if not question.strip():
             st.error("Please enter a question.")
@@ -1557,16 +1587,31 @@ def page_analyse():
         status_ph = st.empty()
 
         try:
-            result = run_analysis(intelligence, question, analysis_model,
-                                  lambda msg: status_ph.info(f"⏳ {msg}"))
-            status_ph.empty()
+            # Choose prompt based on source — notes get the direct Q&A prompt,
+            # brief/session get the structured inference prompt
+            if using_notes:
+                prompt = NOTES_QA_PROMPT.format(
+                    notes=active_content, question=question.strip()
+                )
+                status_ph.info("⏳ Searching notes for an answer…")
+                ph = st.empty()
+                resp = generate_with_retry(analysis_model, prompt, stream=True)
+                result, _ = stream_and_collect(resp, ph)
+                status_ph.empty()
+            else:
+                result = run_analysis(active_content, question, analysis_model,
+                                      lambda msg: status_ph.info(f"⏳ {msg}"))
+                status_ph.empty()
 
             if not result.strip():
                 raise ValueError("Model returned an empty response.")
 
-            # Store analysis history
             analyses = st.session_state.setdefault("analysis_history", [])
-            analyses.append({"question": question.strip(), "answer": result.strip()})
+            analyses.append({
+                "question": question.strip(),
+                "answer":   result.strip(),
+                "mode":     "notes" if using_notes else "brief",
+            })
 
         except Exception as e:
             status_ph.empty()
@@ -1581,13 +1626,14 @@ def page_analyse():
     for i, entry in enumerate(reversed(analyses)):
         st.divider()
         entry_num = len(analyses) - i
+        mode_label = "📄 from notes" if entry.get("mode") == "notes" else "★ from brief"
         col_q, col_copy = st.columns([4, 1])
         with col_q:
-            st.markdown(f"**Q{entry_num}: {entry['question']}**")
+            st.markdown(f"**Q{entry_num}:** {entry['question']}  `{mode_label}`")
         with col_copy:
             copy_button(entry["answer"], f"Copy A{entry_num}")
 
-        # Render in an amber-tinted container to visually distinguish from factual output
+        # Amber box — visually distinct from factual notes/summary output
         st.warning(entry["answer"], icon="🔍")
 
     if len(analyses) > 1:
