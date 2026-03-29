@@ -341,23 +341,24 @@ Target: approximately {word_count} words for the Detailed Summary. The Brief sho
 
 ## DETAILED SUMMARY
 
-### Expert Background
-[Only if the intelligence brief contains background information. Skip entirely if not present.]
+**HOW TO STRUCTURE THE DETAILED SUMMARY:**
 
-### Core Views
-[The expert's main stated positions. 4–6 bullets. Start each bullet with the substance. Use the expert's own framing where captured in the brief.]
+Step 1 — Identify the main topics discussed in this call from the intelligence brief. Let the topics emerge from the content — do not force it into a pre-defined skeleton. A typical call has 3–6 main topics.
 
-### Key Evidence & Data
-[Specific facts, numbers, company references, and examples from the brief. One bullet per distinct data point. Include the context that was stated — not context you are adding.]
+Step 2 — For each topic, write a **bold topic heading** followed by 2–4 sentences of coherent prose. The prose should:
+- Read as a narrative account, not a list of facts
+- Weave data points, specific numbers, and company names in naturally, as part of sentences rather than as standalone bullets
+- Include a direct quote from the brief inline if one is relevant to this topic (format: *"quote"*)
+- Connect related facts with language like "because", "however", "this contrasts with", "the expert noted that... and attributed this to..."
+- Capture the expert's stated confidence level or caveats where relevant ("he was confident that...", "she cautioned that...")
 
-### Risks & Uncertainties
-[Only risks and uncertainties the expert themselves raised. Preserve their stated level of confidence. Do not add risks they did not mention.]
+Step 3 — If a topic has more than 3–4 distinct data points that are hard to weave into prose without cluttering it, follow the prose with a compact indented list of those specifics only.
 
-### Non-Consensus Views
-[Only views the expert described as contrarian or that the brief identifies as non-consensus. Skip this section if the brief contains none.]
+Step 4 — After all topic sections, add:
 
-### Direct Quotes
-[The verbatim quotes from the brief. Do not paraphrase — use exact wording.]
+### Topics Noted but Not Covered in Depth
+A brief list of subjects that appear in the intelligence brief but were not given their own section — either because they were mentioned briefly or were less central to the call. Format: one line per topic with a short note on what was mentioned.
+*This section lets the reader audit what was deprioritised.*
 
 ---
 INTELLIGENCE BRIEF:
@@ -373,29 +374,38 @@ Target: approximately {word_count} words for the Detailed Summary. The Brief sho
 ---
 
 ## BRIEF
-[~100 words. States the purpose of the meeting, the key decisions made, and the most critical action items — all from the brief. Prose format, no headers.]
+[~100 words. Flowing prose that states the meeting's purpose, the key decisions reached, and the most critical actions arising — all drawn strictly from the brief. No headers or bullet points. Should read as a forwardable paragraph.]
 
 ---
 
 ## DETAILED SUMMARY
 
-### Meeting Purpose & Context
-[As stated in the intelligence brief.]
+**HOW TO STRUCTURE THE DETAILED SUMMARY:**
 
-### Decisions Made
-[Each decision from the brief, numbered. Include the stated rationale where the brief records one.]
+Step 1 — Identify the main topics discussed in this meeting from the intelligence brief. Let the topics emerge from the content — do not force it into a pre-defined skeleton. A typical management meeting has 3–6 main topics (e.g. a strategic decision, a budget discussion, a delivery issue).
+
+Step 2 — For each topic, write a **bold topic heading** followed by 2–4 sentences of coherent prose. The prose should:
+- Read as a narrative account, not a list of facts
+- Weave in specific numbers, owners, and deadlines naturally
+- Include a direct quote from the brief inline if relevant (format: *"quote"*)
+- Connect related points with language like "because", "however", "leading to"
+- Capture any stated rationale for decisions
+
+Step 3 — If a topic has more than 3–4 distinct data points that would clutter prose, follow the prose with a compact indented list of those specifics only.
+
+Step 4 — After all topic sections, if the brief records action items, add:
 
 ### Action Items
 
 | Owner | Action | Deadline |
 |-------|--------|----------|
-[Populated from the action items in the brief. "Not stated" for any deadlines not recorded.]
+[One row per action item from the brief. Use "Not stated" for any missing deadlines or owners.]
 
-### Key Debates
-[As recorded in the brief — what was contested, what positions were held, how it was resolved.]
+Step 5 — Finally, add:
 
-### Open Issues & Next Steps
-[Deferred decisions and next steps as stated in the brief.]
+### Topics Noted but Not Covered in Depth
+A brief list of subjects that appear in the intelligence brief but were not given their own section — either because they were mentioned briefly or were less central to the meeting. Format: one line per topic with a short note on what was mentioned.
+*This section lets the reader audit what was deprioritised.*
 
 ---
 INTELLIGENCE BRIEF:
@@ -411,26 +421,30 @@ Target: approximately {word_count} words for the Detailed Summary. The Brief sho
 ---
 
 ## BRIEF
-[~100 words. States what the discussion was about, the key conclusion, and the most important next step — all from the brief. Prose format, no headers.]
+[~100 words. Flowing prose that states what the discussion was about, the key conclusion reached, and the most important next step — all drawn strictly from the brief. No headers or bullet points. Should read as a forwardable paragraph.]
 
 ---
 
 ## DETAILED SUMMARY
 
-### Context & Goal
-[As stated in the intelligence brief.]
+**HOW TO STRUCTURE THE DETAILED SUMMARY:**
 
-### Key Arguments & Positions
-[The views expressed as recorded in the brief. Do not add attribution not present in the brief.]
+Step 1 — Identify the main topics discussed in this meeting from the intelligence brief. Let the topics emerge from the content — do not force it into a pre-defined skeleton. A typical internal discussion has 3–5 main topics (e.g. a problem being diagnosed, a proposal being evaluated, a process being debated).
 
-### Where There Was Agreement
-[As stated in the brief.]
+Step 2 — For each topic, write a **bold topic heading** followed by 2–4 sentences of coherent prose. The prose should:
+- Read as a narrative account of how the discussion unfolded, not a list of points
+- Capture who said what only where the brief records attribution
+- Include a direct quote from the brief inline if relevant (format: *"quote"*)
+- Note where there was agreement or disagreement naturally within the prose — avoid separate Agreement/Disagreement sections unless the split is the whole story of that topic
+- Connect related points with language like "because", "however", "this led to"
 
-### Where There Was Disagreement
-[As stated in the brief.]
+Step 3 — If a topic has more than 3–4 distinct data points that would clutter prose, follow the prose with a compact indented list of those specifics only.
 
-### Conclusions & Next Steps
-[What was concluded and what happens next, as recorded in the brief.]
+Step 4 — After all topic sections, add:
+
+### Topics Noted but Not Covered in Depth
+A brief list of subjects that appear in the intelligence brief but were not given their own section — either because they were mentioned briefly or were less central to the discussion. Format: one line per topic with a short note on what was mentioned.
+*This section lets the reader audit what was deprioritised.*
 
 ---
 INTELLIGENCE BRIEF:
