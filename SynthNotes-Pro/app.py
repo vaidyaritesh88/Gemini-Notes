@@ -27,8 +27,26 @@ MODELS = {
     "Gemini 2.5 Flash Lite (Cheap)": "gemini-2.5-flash-lite",
     "Gemini 2.5 Pro (Best)":         "gemini-2.5-pro",
     "Gemini 3.0 Flash":              "gemini-3-flash-preview",
+    "Gemini 3.5 Flash":              "gemini-3.5-flash",
     "Gemini 2.0 Flash":              "gemini-2.0-flash-lite",
     "Gemini 1.5 Flash":              "gemini-1.5-flash",
+}
+
+# Approximate pricing per 1M tokens (USD), under 200K-token context. Verified May 2026.
+# Tuple = (input_price, output_price). Used only by the in-app cost panel; for
+# authoritative billing see your Google Cloud project's billing reports. Audio input
+# tokens are billed at the text-input rate in this table — a small underestimate for
+# audio-heavy workflows, flagged in the cost-panel caption.
+MODEL_PRICING = {
+    "gemini-2.5-pro":         (1.25, 10.00),
+    "gemini-2.5-flash":       (0.30,  2.50),
+    "gemini-2.5-flash-lite":  (0.10,  0.40),
+    "gemini-3.5-flash":       (0.50,  3.00),  # estimate — exact pricing TBD
+    "gemini-3-flash-preview": (0.50,  3.00),
+    "gemini-3.1-flash-lite":  (0.25,  1.50),
+    "gemini-3.1-pro-preview": (2.00, 12.00),
+    "gemini-2.0-flash-lite":  (0.075, 0.30),
+    "gemini-1.5-flash":       (0.075, 0.30),
 }
 
 MEETING_TYPES = ["Expert Meeting", "Management Meeting", "Internal Discussion"]
@@ -51,8 +69,13 @@ PROMPTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_p
 
 
 # ── 2. NOTES PROMPTS ───────────────────────────────────────────────────────────
-# These are identical to the Lite app — proven, high-quality capture prompts.
-# The Pro difference comes entirely from the intelligence extraction layer below.
+# Expert Meeting prompts are the original, proven, high-quality capture prompts.
+# Management Meeting and Internal Discussion prompts use the SAME Q&A structure as
+# Expert (because that format gives the highest-fidelity output), but with
+# meeting-type-appropriate terminology — management is "management" or the named role
+# (CEO/CFO/etc.), never "the expert"; internal participants are "the speaker(s)" or
+# "the team", never "experts". The Pro difference still comes from the intelligence
+# extraction layer below.
 
 EXPERT_MEETING_DETAILED_PROMPT = """### **PRIMARY DIRECTIVE: MAXIMUM DETAIL & STRICT COMPLETENESS**
 Your goal is to produce the most thorough, granular notes possible. Remove conversational filler ("um," "you know," repetition) but **nothing substantive should be omitted.** Every factual claim, example, explanation, aside, and data point in the transcript must appear in your notes. When in doubt, INCLUDE it. Err heavily on the side of over-inclusion. Longer, more detailed notes are always preferred over concise ones.
@@ -116,49 +139,147 @@ Structure the main body in Question/Answer format.
 -   **PRIORITY #1: CAPTURE ALL HARD DATA.** Numbers, percentages, company names, metrics, specific entities.
 -   **PRIORITY #2: CAPTURE ALL NUANCE.** Sentiment, qualifiers, key examples, cause & effect chains."""
 
-MANAGEMENT_MEETING_PROMPT = """### **NOTES STRUCTURE: MANAGEMENT MEETING**
+MANAGEMENT_MEETING_DETAILED_PROMPT = """### **PRIMARY DIRECTIVE: MAXIMUM DETAIL & STRICT COMPLETENESS**
+Your goal is to produce the most thorough, granular notes possible from a **management meeting** (e.g. an analyst's call with company management, an investor meeting, or a one-on-one with an executive). Remove conversational filler ("um," "you know," repetition) but **nothing substantive should be omitted.** Every factual claim, example, explanation, aside, and data point in the transcript must appear in your notes. When in doubt, INCLUDE it. Err heavily on the side of over-inclusion. Longer, more detailed notes are always preferred over concise ones.
 
-Structure the notes to capture decisions, action items, and key discussion points.
+### **TERMINOLOGY — DO NOT MISLABEL THE SPEAKERS**
+This is a **management meeting**, NOT an expert consultation. Refer to the company-side speakers as **"management"**, or by their specific role/name where known ("the CEO", "the CFO", "the Head of Strategy"). **NEVER refer to management as "the expert" or "the experts."** If specific names or roles are provided in the speaker context, use those. If the analyst side asks questions, refer to them as "the analyst" where needed.
 
-**(1.) Meeting Overview (Conditional):**
-- If the transcript begins with an agenda or introductions, capture attendees, date, and agenda items as bullet points.
+### **NOTES STRUCTURE**
 
-**(2.) Discussion Topics:**
-Structure the body by topic/agenda item using **bold headings**.
+**(1.) Opening overview or Management background (Conditional):**
+- If the transcript chunk begins with an overview, agenda, or management introductions, include it FIRST as bullet points.
+- **DO:** Capture ALL details (names, titles, roles, tenure, prior positions, segments/divisions owned, company background where stated).
+- **DO NOT:** Summarize or include sell-side/broker boilerplate.
+- If no intro exists, OMIT this section entirely.
 
-For each topic:
-- **Key Points:** Bullet-point the main arguments, data, and perspectives shared.
-- **Decisions Made:** Clearly state any decisions reached, who made them, and the rationale.
-- **Action Items:** List each action item with the responsible person and any stated deadline.
-- **Open Questions:** Note unresolved issues or items deferred for follow-up.
+**(2.) Q&A format:**
+Structure the main body STRICTLY in Question/Answer format. Most analyst-management meetings ARE Q&A — capture them that way. If the transcript is monologue-style (e.g. prepared management commentary or an opening statement), convert each distinct topic management addresses into a bold question that captures what was at issue, and the substance becomes the bulleted answer below.
 
-**PRIORITY #1: CAPTURE ALL DECISIONS AND ACTION ITEMS.** These are the most critical outputs.
-**PRIORITY #2: CAPTURE ALL DATA.** Names, numbers, dates, metrics, and specific references.
-**PRIORITY #3: PRESERVE CONTEXT.** Include the reasoning behind decisions and any dissenting views."""
+**(2.A) Questions:**
+-   Identify the core question being asked and rephrase it clearly in **bold**. Do NOT copy the question verbatim from the transcript — clean up filler, false starts, and rambling phrasing into a clear, well-formed question that preserves the original intent.
+-   **NO LABELS:** Do NOT prefix questions with "Q:", "Q.", "Question:", or any similar label. The bold question text stands alone.
+-   If the analyst provides context, framing, or a multi-part question, capture the full scope — do not reduce a multi-part question to a single line.
+-   **LONG QUESTIONS / PREAMBLE:** Substantive analyst framing or background is part of the question and must be preserved as part of the bold question text. Do NOT treat the preamble as part of the answer.
+-   **SPACING:** Leave exactly one blank line between the end of one answer and the start of the next bold question, so each Q&A pair is visually separated.
 
-INTERNAL_DISCUSSION_PROMPT = """### **NOTES STRUCTURE: INTERNAL DISCUSSION**
+**(2.B) Answers (management's response):**
+-   Use bullet points (`-`) directly below the question (no blank line between the bold question and its first bullet).
+-   Each bullet point must convey specific factual information in a clear, complete sentence.
+-   Use **multiple bullet points** per answer — do NOT collapse a detailed response into a single bullet.
+-   **ZERO SKIPPING RULE:** If management said it with substance, it must appear in your notes. Do NOT skip examples, anecdotes, specific sentences, or supporting details even if they seem minor. Every distinct point gets its own bullet. If an answer contains 8 substantive points, you must produce at least 8 bullets — never condense them into 3-4.
+-   **PRIORITY #1: CAPTURE ALL HARD DATA.** This includes all names, monetary values (`$`, `₹`), percentages (`%`), revenue/EBITDA/margin figures, growth rates, capex, capacity, store counts, market shares, customer counts, named segments, brand names, product names, customer names, geographies, and time periods.
+-   **PRIORITY #2: CAPTURE ALL NUANCE & REASONING.** Do not over-summarize or reduce complex answers to surface-level statements. You must retain:
+    -   **Sentiment & Tone:** Note if management is confident, cautious, hedging, defensive, or enthusiastic (e.g., "management was highly confident that...," "the CFO cautioned that...," "management hedged on...").
+    -   **Qualifiers & Conditions:** Preserve modifying words that change meaning (e.g., "typically," "in most cases," "subject to," "we expect," "roughly," "approximately," "should").
+    -   **Guidance & Outlook:** Preserve forward-looking statements with their exact qualifiers ("we are targeting...", "we expect...", "we are guiding to...", "we believe we can achieve...").
+    -   **Key Examples & Anecdotes:** If management uses a specific example, customer win, deal reference, plant/store-level anecdote, or case study to illustrate a point, capture it in full — these are often the highest-signal parts of a management call.
+    -   **Cause & Effect:** Retain any reasoning chains provided (e.g., "...because input costs eased," "...which drove the 80bps margin expansion").
+    -   **Comparisons & Contrasts:** If management compares segments, geographies, time periods, competitors, or business lines, capture both sides with the specific details for each.
+    -   **Tangential but relevant points:** If management volunteers additional context, background, or related information beyond the direct question, include it — do NOT discard it as off-topic.
+-   **PRIORITY #3: PRESERVE MULTI-STEP EXPLANATIONS.** If an answer involves a sequence of steps, a timeline, a capital allocation plan, or a logical chain, preserve the full sequence rather than summarizing the conclusion only.
+-   **PRIORITY #4: PRESERVE COMMITMENTS, TARGETS, AND DECISIONS INLINE.** When management announces a target, deadline, capex commitment, or strategic decision, capture it within the relevant Q&A bullet — do NOT strip these into a separate "decisions" or "action items" section. They belong with the context in which management discussed them."""
 
-Structure the notes to capture the flow of ideas, key arguments, and conclusions. This is NOT a Q&A format — focus on capturing the substance of the discussion as it evolved.
+MANAGEMENT_MEETING_CONCISE_PROMPT = """### **PRIMARY DIRECTIVE: EFFICIENT & NUANCED**
+Your goal is to be **efficient**, not just brief, when capturing a **management meeting** (analyst-management call, investor meeting, one-on-one with an executive). Remove conversational filler ("um," "you know," repetition) but **preserve all substantive information**. Your output should be concise yet information-dense.
 
-**(1.) Discussion Context (Conditional):**
-- If the discussion has a stated purpose or background, capture it as bullet points at the top.
+### **TERMINOLOGY — DO NOT MISLABEL THE SPEAKERS**
+This is a **management meeting**, NOT an expert consultation. Refer to the company-side speakers as **"management"**, or by their specific role/name where known ("the CEO", "the CFO", "the Head of Strategy"). **NEVER refer to management as "the expert" or "experts".** If the analyst side asks questions, refer to them as "the analyst" where needed.
 
-**(2.) Discussion Flow:**
-Structure the body by topic or theme using **bold headings**.
+### **NOTES STRUCTURE**
 
-For each topic:
-- Capture each participant's key contributions and perspectives as bullet points.
-- Note areas of agreement and disagreement.
-- Highlight any data, examples, or evidence cited.
-- Flag any concerns, risks, or caveats raised.
+**(1.) Opening overview or Management background (Conditional):**
+- If the transcript chunk begins with an overview, agenda, or management introductions, include it FIRST as bullet points.
+- **DO:** Capture ALL details (names, titles, roles, segments owned).
+- **DO NOT:** Summarize.
+- If no intro exists, OMIT this section entirely.
 
-**(3.) Conclusions & Next Steps:**
-- Summarize any conclusions reached.
-- List follow-up items or next steps with owners if identified.
+**(2.) Q&A format:**
+Structure the main body in Question/Answer format. If the transcript is monologue-style (prepared management commentary, opening remarks), convert each distinct topic management addresses into a bold question with the substance as bulleted answers below.
 
-**PRIORITY #1: CAPTURE ALL PERSPECTIVES.** Include different viewpoints even if they disagree.
-**PRIORITY #2: CAPTURE ALL DATA.** Names, numbers, references, and specific examples.
-**PRIORITY #3: PRESERVE REASONING.** Include the "why" behind opinions and conclusions."""
+**(2.A) Questions:**
+-   Identify the core question and rephrase it clearly in **bold**. Do NOT copy verbatim — clean up filler and rambling into a clear, well-formed question.
+-   **NO LABELS:** Do NOT prefix questions with "Q:", "Q.", "Question:", or similar.
+-   **PREAMBLE:** Preserve substantive analyst framing as part of the bold question text.
+-   **SPACING:** One blank line between the end of one answer and the next bold question.
+
+**(2.B) Answers (management's response):**
+-   Use bullet points (`-`) directly below the question.
+-   Each bullet must convey specific factual information in a clear, complete sentence.
+-   **PRIORITY #1: CAPTURE ALL HARD DATA.** Numbers, percentages, monetary figures, growth rates, capex, capacity, market shares, guidance, targets, named segments, brands, geographies, time periods.
+-   **PRIORITY #2: CAPTURE ALL NUANCE.** Sentiment (confident, cautious, hedging, defensive), qualifiers ("we expect", "we are targeting", "subject to"), key examples and anecdotes, cause & effect chains, comparisons across segments/geographies/competitors.
+-   **PRIORITY #3: PRESERVE COMMITMENTS INLINE.** Targets, deadlines, capex commitments, strategic decisions — capture within the relevant Q&A bullet; do NOT strip into a separate section."""
+
+INTERNAL_DISCUSSION_DETAILED_PROMPT = """### **PRIMARY DIRECTIVE: MAXIMUM DETAIL & STRICT COMPLETENESS**
+Your goal is to produce the most thorough, granular notes possible from an **internal team discussion** (e.g. a research-team debate, an investment committee discussion, a strategy meeting among colleagues). Remove conversational filler ("um," "you know," repetition) but **nothing substantive should be omitted.** Every factual claim, example, position, counter-argument, and data point in the transcript must appear in your notes. When in doubt, INCLUDE it. Longer, more detailed notes are always preferred over concise ones.
+
+### **TERMINOLOGY — DO NOT MISLABEL THE SPEAKERS**
+This is an **internal discussion among colleagues**, NOT an expert consultation. Refer to participants as **"the speaker(s)"**, **"the team"**, or by name where named in the transcript or speaker context. **NEVER refer to participants as "experts" or "the expert".** Where the transcript attributes views to specific people, preserve that attribution (e.g., "X argued that...", "Y countered with...").
+
+### **NOTES STRUCTURE**
+
+**(1.) Opening overview or Discussion context (Conditional):**
+- If the transcript chunk begins with an overview, agenda, or context-setting, include it FIRST as bullet points.
+- **DO:** Capture stated purpose, the question or decision being discussed, participants (names, roles), any background framing.
+- **DO NOT:** Summarize or include meeting logistics.
+- If no intro exists, OMIT this section entirely.
+
+**(2.) Q&A format (adapted for discussion):**
+Structure the main body STRICTLY in Question/Answer format. An internal discussion is rarely a literal Q&A — to apply this structure, **treat each distinct issue, question, or topic raised in the discussion as a bold "question"**, and capture the discussion that followed as the bulleted "answer" below it. The bold "question" should be a clean, well-formed statement of *what was at issue*; the bullets capture *what the team said about it*.
+
+**(2.A) Questions (issues / topics raised):**
+-   Identify each distinct issue, question, or decision point raised in the discussion and rephrase it clearly in **bold**. Examples: *"Whether to add to the position given the Q3 miss"*, *"How to interpret the channel-check feedback on pricing"*, *"What the regulatory change means for the thesis"*.
+-   **NO LABELS:** Do NOT prefix with "Q:", "Topic:", "Issue:", or any similar label. The bold statement stands alone.
+-   If an issue has multiple sub-questions, capture the full scope — do not reduce to a single line.
+-   **PREAMBLE:** Substantive framing that introduces the issue (background, prior context, why it was raised) is part of the bold statement and must be preserved within it.
+-   **SPACING:** Leave exactly one blank line between the end of one discussion and the start of the next bold issue.
+
+**(2.B) Answers (the discussion that followed):**
+-   Use bullet points (`-`) directly below the bold issue (no blank line between them).
+-   Each bullet point must convey a specific position, argument, piece of evidence, or data point in a clear, complete sentence.
+-   **ATTRIBUTION:** Where the transcript attributes a view to a specific person, preserve it in the bullet ("X argued that...", "Y countered..."). Where views are shared or unattributed, state them without forcing attribution.
+-   **ZERO SKIPPING RULE:** Every distinct point, argument, counter-argument, and piece of evidence raised must appear as its own bullet. Do NOT condense multiple positions into one bullet. If the discussion contains 8 substantive points, you must produce at least 8 bullets.
+-   **PRIORITY #1: CAPTURE ALL HARD DATA.** Numbers, percentages, dates, named companies, named products/people/geographies, prior decisions or positions referenced, external data sources cited.
+-   **PRIORITY #2: CAPTURE ALL POSITIONS, REASONING, AND DISAGREEMENT.** Do not over-summarize. Retain:
+    -   **All sides:** Capture every distinct view raised, including dissenting and minority views. Do NOT favour the dominant view or strip out the dissent.
+    -   **Reasoning chains:** Preserve the "why" behind each position (e.g., "...because the comparable in 2019 was different," "...assuming the new capacity comes online by Q2").
+    -   **Evidence cited:** Capture any data, examples, prior calls, prior notes, or external references invoked to support a position.
+    -   **Sentiment & confidence:** Note where the speaker was confident, uncertain, hedging, or changing their view mid-discussion ("X was initially sceptical but came around when...").
+    -   **Agreement vs disagreement:** Make these explicit within the bullets ("the team agreed that...", "X and Y disagreed on...").
+    -   **Caveats and risks raised:** Preserve in the speaker's own framing.
+-   **PRIORITY #3: PRESERVE MULTI-STEP REASONING.** If a participant builds an argument step-by-step, preserve the full chain rather than the conclusion only.
+-   **PRIORITY #4: PRESERVE CONCLUSIONS AND OPEN ITEMS INLINE.** If the discussion reaches a conclusion or leaves something open, capture it within the relevant Q&A bullet — do NOT strip these into a separate "next steps" or "conclusions" section. They belong with the discussion that produced them."""
+
+INTERNAL_DISCUSSION_CONCISE_PROMPT = """### **PRIMARY DIRECTIVE: EFFICIENT & NUANCED**
+Your goal is to be **efficient**, not just brief, when capturing an **internal team discussion** (research-team debate, investment committee, strategy meeting among colleagues). Remove conversational filler ("um," "you know," repetition) but **preserve all substantive information**. Your output should be concise yet information-dense.
+
+### **TERMINOLOGY — DO NOT MISLABEL THE SPEAKERS**
+This is an **internal discussion among colleagues**, NOT an expert consultation. Refer to participants as **"the speaker(s)"**, **"the team"**, or by name where named in the transcript or speaker context. **NEVER refer to participants as "experts" or "the expert".** Preserve attribution where the transcript provides it ("X argued that...", "Y countered...").
+
+### **NOTES STRUCTURE**
+
+**(1.) Opening overview or Discussion context (Conditional):**
+- If the transcript chunk begins with an overview or context-setting, include it FIRST as bullet points.
+- **DO:** Capture stated purpose, the question being discussed, participants.
+- **DO NOT:** Summarize.
+- If no intro exists, OMIT this section entirely.
+
+**(2.) Q&A format (adapted for discussion):**
+Structure the main body in Question/Answer format. **Treat each distinct issue, question, or topic raised in the discussion as a bold "question"**, and capture the discussion that followed as the bulleted "answer".
+
+**(2.A) Questions (issues / topics raised):**
+-   Identify each distinct issue and rephrase it clearly in **bold**. Examples: *"Whether to add to the position given the Q3 miss"*, *"How to interpret the channel-check feedback on pricing"*.
+-   **NO LABELS:** Do NOT prefix with "Q:", "Topic:", "Issue:", or similar.
+-   **PREAMBLE:** Preserve substantive framing as part of the bold statement.
+-   **SPACING:** One blank line between the end of one discussion and the next bold issue.
+
+**(2.B) Answers (the discussion that followed):**
+-   Use bullet points (`-`) directly below the bold issue.
+-   Each bullet must convey a specific position, argument, or data point.
+-   **ATTRIBUTION:** Preserve where the transcript provides it ("X argued...", "Y countered...").
+-   **PRIORITY #1: CAPTURE ALL HARD DATA.** Numbers, percentages, named companies, products, geographies, dates, prior decisions or references invoked.
+-   **PRIORITY #2: CAPTURE ALL POSITIONS AND REASONING.** All sides including minority views; the "why" behind each position; evidence cited; sentiment / confidence; agreement vs disagreement made explicit.
+-   **PRIORITY #3: PRESERVE CONCLUSIONS INLINE.** Capture within the relevant Q&A bullet; do NOT strip into a separate "next steps" or "conclusions" section."""
 
 PROMPT_INITIAL = """You are a High-Fidelity Factual Extraction Engine. Your task is to analyze a meeting transcript chunk and generate detailed, factual notes.
 Your primary directive is **100% completeness and accuracy**. Process the transcript sequentially and generate notes following the structure below.
@@ -241,61 +362,93 @@ MEETING NOTES:
 {notes}
 """
 
-INTEL_MANAGEMENT_PROMPT = """You are extracting structured intelligence from management meeting notes.
+INTEL_MANAGEMENT_PROMPT = """You are a research analyst extracting structured intelligence from management meeting notes.
 
-**CRITICAL RULE: Only include what was actually said or decided in the meeting. Do not infer, interpret, or add your own analysis.**
+**CRITICAL RULE: Only include what management actually said. Do not infer, interpret, or add your own analysis. Every point must be traceable to a specific statement in the notes.**
+
+**TERMINOLOGY: Refer to the company-side speakers as "management" or by their specific role ("the CEO", "the CFO", "the COO") — NEVER as "the expert" or "experts".**
 
 ---
 
-## MEETING CONTEXT
-1–2 sentences stating the purpose of this meeting and its overall outcome, as described in the notes.
+## MANAGEMENT BACKGROUND
+[Only if the notes contain background information about the speakers, their roles, tenure, or the company/segments they cover. Skip this section entirely if no such background is present in the notes.]
 
-## DECISIONS MADE
-Each decision reached in the meeting. Be specific — not "discussed the budget" but "approved Q3 budget at $2.4M."
-Format: **[Decision]** — Rationale: [the stated reason, if given in the notes]
-If no rationale was stated, omit that part.
+## CORE THESIS
+Management's 2–3 overarching views as stated in the meeting — their headline positions on the business, the market, or the strategic direction. Use management's own framing where possible.
 
-## ACTION ITEMS
-Each action item as recorded in the notes.
-Format: **[Owner]** | [Specific action] | Due: [date or timeframe stated, or "Not stated"]
+## KEY INSIGHTS
+The most important, substantive things management said — prioritising non-obvious points, strategic shifts, and specific commitments over generic context. Each bullet should be a specific, complete statement. Aim for 6–10 bullets.
+- Do NOT include widely-known facts unless management made a specific new claim about them.
+- Do NOT collapse multiple distinct points into one bullet.
 
-## KEY DEBATES
-Topics that were contested in the meeting. For each: what was the question, what positions were expressed, and how it was resolved (or note if it was not resolved).
+## HARD DATA & FACTS
+Every specific figure, statistic, target, or named reference management provided:
+- Numbers, percentages, growth rates, margins, capex, capacity, market shares, customer counts
+- Guidance, targets, and forward-looking numbers with their stated qualifiers
+- Named companies, products, brands, segments, geographies with specific context
+- Dates, timelines, durations
+Format: one bullet per data point with just enough context to understand it.
 
-## UNRESOLVED ISSUES
-Decisions deferred, open questions, or items explicitly flagged for follow-up in the meeting.
+## DIRECT QUOTES
+2–4 verbatim sentences from management that best capture their views or commitments. Choose the most specific and quotable lines.
+Format: *"[exact quote]"* — [brief topic label, with speaker role if known]
 
-## KEY DATA & FACTS REFERENCED
-Important numbers, metrics, targets, or facts cited during the meeting that informed discussion or decisions.
+## EXPRESSED RISKS & UNCERTAINTIES
+Things management themselves flagged as risks, concerns, headwinds, downside scenarios, or areas of uncertainty. Note their stated confidence level where apparent (e.g., "management cautioned that...", "the CFO was uncertain about...").
+Only include risks management actually raised — do NOT add risks of your own.
+
+## STATED NON-CONSENSUS VIEWS
+Views management themselves described as contrarian, differentiated, or against conventional wisdom — or views that are clearly at odds with a commonly-held position as stated in the notes.
+Leave this section blank if the notes contain no such views.
+
+## QUESTIONS & UNCERTAINTIES MANAGEMENT RAISED
+Open questions, unresolved issues, or areas management themselves said need further work, monitoring, or future visibility. Only include things management explicitly flagged — not questions you think are interesting.
 
 ---
 MEETING NOTES:
 {notes}
 """
 
-INTEL_INTERNAL_PROMPT = """You are extracting structured intelligence from internal discussion notes.
+INTEL_INTERNAL_PROMPT = """You are a research analyst extracting structured intelligence from internal team discussion notes.
 
-**CRITICAL RULE: Only include what was actually said in the discussion. Do not infer, interpret, or add your own analysis.**
+**CRITICAL RULE: Only include what was actually said in the discussion. Do not infer, interpret, or add your own analysis. Every point must be traceable to a specific statement in the notes.**
+
+**TERMINOLOGY: Refer to participants as "the speaker(s)", "the team", or by name where named — NEVER as "experts" or "the expert".**
 
 ---
 
-## DISCUSSION GOAL
-What this discussion was trying to achieve or decide, as stated in the notes.
+## DISCUSSION CONTEXT
+[Only if the notes contain background about the discussion's purpose, the question or decision being debated, or the participants. Skip this section entirely if no such context is present in the notes.]
 
-## VIEWS & POSITIONS EXPRESSED
-The main arguments, positions, or perspectives raised by participants. Capture the substance — what were people actually saying and why? Attribute views to individuals only where the notes do so.
+## CORE THESIS
+The 2–3 overarching views or working hypotheses that emerged in the discussion — the headline positions held by the team. Where attribution exists in the notes, preserve it.
 
-## WHERE THERE WAS AGREEMENT
-Points where the group converged or reached shared understanding, as recorded in the notes.
+## KEY INSIGHTS
+The most important, substantive points raised in the discussion — prioritising non-obvious arguments, new evidence, and shifts in view over restating prior beliefs. Each bullet should be a specific, complete statement. Aim for 6–10 bullets.
+- Capture insights from across all participants, not just the dominant voice.
+- Do NOT collapse multiple distinct points into one bullet.
 
-## WHERE THERE WAS DISAGREEMENT
-Points of contention as they appear in the notes. What was the nature of the disagreement?
+## HARD DATA & FACTS
+Every specific figure, statistic, or named reference raised in the discussion:
+- Numbers, percentages, prices, dates, ratios
+- Named companies, products, people, geographies with specific context
+- References to prior notes, prior calls, or external data sources
+Format: one bullet per data point with just enough context to understand it.
 
-## CONCLUSIONS REACHED
-What was actually concluded or agreed upon, as stated in the notes. Be precise about what was settled vs. what remains open.
+## DIRECT QUOTES
+2–4 verbatim sentences from the discussion that best capture the most important arguments or conclusions. Choose the most specific and quotable lines.
+Format: *"[exact quote]"* — [speaker name/role if known, brief topic label]
 
-## NEXT STEPS
-Actions or decisions to happen next, as stated in the notes. Include owners and timelines if the notes record them.
+## EXPRESSED RISKS & UNCERTAINTIES
+Risks, concerns, or downside scenarios that participants themselves raised in the discussion. Note stated confidence where apparent (e.g., "the speaker was cautious about...", "X flagged the risk that...").
+Only include risks participants actually raised — do NOT add risks of your own.
+
+## STATED NON-CONSENSUS VIEWS
+Views participants described as contrarian, against the team's prior consensus, or differing from the dominant industry/market view — as recorded in the notes.
+Leave this section blank if the notes contain no such views.
+
+## QUESTIONS & UNCERTAINTIES THE TEAM RAISED
+Open questions, items the team deferred, or areas participants themselves said need further work or monitoring. Only include things the team explicitly flagged in the discussion — not questions you think are interesting.
 
 ---
 MEETING NOTES:
@@ -373,23 +526,26 @@ INTELLIGENCE BRIEF:
 {intelligence}
 """
 
-SUMMARY_MANAGEMENT_PROMPT = """You are writing a factual summary of a management meeting.
+SUMMARY_MANAGEMENT_PROMPT = """You are writing a factual summary of a management meeting for a professional reader.
 
-**CRITICAL RULE: Only include information from the intelligence brief below. Do not add your own analysis or inferences.**
+**CRITICAL RULE: Only include information that appears in the intelligence brief below. Do not add your own analysis, inferences, or interpretations. If something is not in the brief, do not include it.**
+
+**TERMINOLOGY: Refer to the company-side speakers as "management" or by their specific role ("the CEO", "the CFO") — NEVER as "the expert" or "experts".**
 
 **LANGUAGE RULES — read carefully before writing:**
 - Write in plain, neutral, declarative sentences. No rhetorical flourishes.
-- Do NOT use evaluative words you are adding yourself — words like "notably", "importantly", "significantly", "key", "critical", "concerning" — unless the brief itself uses them.
-- Do NOT add connective language ("however", "despite", "yet", "this contrasts with") to imply a tension or relationship unless the brief explicitly records it. Only use a causal connector ("because", "as a result", "leading to") if the brief states the causal link.
-- Do NOT use words that subtly talk up or talk down a point: "only", "merely", "just", "even", "still" (used rhetorically), "managed to", "failed to".
+- Do NOT use evaluative words you are adding yourself — words like "notably", "importantly", "significantly", "strikingly", "key", "critical", "impressive", "concerning", "surprisingly" — unless the brief itself uses them. These words frame importance; that is the reader's job, not yours.
+- Do NOT add connective language ("however", "despite", "yet", "although", "this contrasts with") to imply a tension or relationship unless the brief explicitly records that contrast or tension. Only use a causal connector ("because", "as a result") if the brief states the causal link.
+- Do NOT use words that subtly talk up or talk down a point: "only", "merely", "just", "even", "still" (when used for rhetorical effect), "managed to", "failed to".
+- Quotes should appear exactly as they are in the brief — do not paraphrase into reported speech that softens or sharpens the original.
 - The goal is a transcript-faithful account. Coherence comes from grouping related facts together, not from editorial framing.
 
-Target: approximately {word_count} words for the Detailed Summary. The Brief should be ~100 words.
+Target: approximately {word_count} words for the Detailed Summary. The Brief should be ~150 words.
 {focus_block}
 ---
 
 ## BRIEF
-[~100 words. Plain prose that states the meeting's purpose, the decisions reached, and the actions arising — all drawn strictly from the brief. No headers or bullet points. Apply the language rules above — no evaluative framing.]
+[~150 words. A concise factual overview: who the management speakers are (if background is in the brief), the main subject of the meeting, and management's core position. Plain prose, no headers or bullets. Written so it stands alone as a quick reference. Apply the language rules above — no evaluative framing.]
 
 ---
 
@@ -397,26 +553,18 @@ Target: approximately {word_count} words for the Detailed Summary. The Brief sho
 
 **HOW TO STRUCTURE THE DETAILED SUMMARY:**
 
-Step 1 — Identify the main topics discussed in this meeting from the intelligence brief. Let the topics emerge from the content — do not force it into a pre-defined skeleton. A typical management meeting has 3–6 main topics (e.g. a strategic decision, a budget discussion, a delivery issue).
+Step 1 — Identify the main topics discussed in this meeting from the intelligence brief. Let the topics emerge from the content — do not force it into a pre-defined skeleton. A typical management meeting has 3–6 main topics.
 
 Step 2 — For each topic, write a **bold topic heading** followed by 2–4 sentences of factual prose. The prose should:
-- Group related facts from the brief into sentences rather than presenting each as an isolated bullet
-- Weave in specific numbers, owners, and deadlines as part of sentences
-- Include a direct quote from the brief inline if relevant (format: *"quote"*) — use the exact wording from the brief
-- Only use connective language where the brief records the relationship
-- Capture stated rationale for decisions using the phrasing in the brief, not your own framing
+- Group related facts from the brief into sentences rather than presenting each fact as an isolated bullet
+- Weave data points, specific numbers, guidance, and named segments/brands in as part of sentences
+- Include a direct quote from the brief inline if one is relevant to this topic (format: *"quote"*) — use the exact wording from the brief
+- Only use connective language where the brief records the relationship (e.g. do not write "however" to imply a contrast the brief does not state)
+- Capture management's stated confidence level or caveats using management's own phrasing where possible
 
-Step 3 — If a topic has more than 3–4 distinct data points that would clutter prose, follow the prose with a compact indented list of those specifics only.
+Step 3 — If a topic has more than 3–4 distinct data points that are hard to weave into prose without cluttering it, follow the prose with a compact indented list of those specifics only.
 
-Step 4 — After all topic sections, if the brief records action items, add:
-
-### Action Items
-
-| Owner | Action | Deadline |
-|-------|--------|----------|
-[One row per action item from the brief. Use "Not stated" for any missing deadlines or owners.]
-
-Step 5 — Finally, add:
+Step 4 — After all topic sections, add:
 
 ### Topics Noted but Not Covered in Depth
 A brief list of subjects that appear in the intelligence brief but were not given their own section — either because they were mentioned briefly or were less central to the meeting. Format: one line per topic with a short note on what was mentioned.
@@ -427,23 +575,27 @@ INTELLIGENCE BRIEF:
 {intelligence}
 """
 
-SUMMARY_INTERNAL_PROMPT = """You are writing a factual summary of an internal team discussion.
+SUMMARY_INTERNAL_PROMPT = """You are writing a factual summary of an internal team discussion for a professional reader.
 
-**CRITICAL RULE: Only include information from the intelligence brief below. Do not add your own analysis or inferences.**
+**CRITICAL RULE: Only include information that appears in the intelligence brief below. Do not add your own analysis, inferences, or interpretations. If something is not in the brief, do not include it.**
+
+**TERMINOLOGY: Refer to participants as "the speaker(s)", "the team", or by name where named in the brief — NEVER as "experts" or "the expert".**
 
 **LANGUAGE RULES — read carefully before writing:**
 - Write in plain, neutral, declarative sentences. No rhetorical flourishes.
-- Do NOT use evaluative words you are adding yourself — words like "notably", "importantly", "significantly", "key", "critical", "concerning" — unless the brief itself uses them.
-- Do NOT add connective language ("however", "despite", "yet", "this contrasts with") to imply a tension or relationship unless the brief explicitly records it. Only use a causal connector ("because", "as a result", "this led to") if the brief states the causal link.
-- Do NOT use words that subtly talk up or talk down a point: "only", "merely", "just", "even", "still" (used rhetorically), "managed to", "failed to".
+- Do NOT use evaluative words you are adding yourself — words like "notably", "importantly", "significantly", "strikingly", "key", "critical", "concerning", "surprisingly" — unless the brief itself uses them. These words frame importance; that is the reader's job, not yours.
+- Do NOT add connective language ("however", "despite", "yet", "although", "this contrasts with") to imply a tension or relationship unless the brief explicitly records that contrast or tension. Only use a causal connector ("because", "as a result") if the brief states the causal link.
+- Do NOT use words that subtly talk up or talk down a point: "only", "merely", "just", "even", "still" (when used for rhetorical effect), "managed to", "failed to".
+- Quotes should appear exactly as they are in the brief — do not paraphrase.
+- Where the brief attributes a view to a specific speaker, preserve that attribution. Where the brief gives no attribution, do not invent one.
 - The goal is a transcript-faithful account. Coherence comes from grouping related facts together, not from editorial framing.
 
-Target: approximately {word_count} words for the Detailed Summary. The Brief should be ~100 words.
+Target: approximately {word_count} words for the Detailed Summary. The Brief should be ~150 words.
 {focus_block}
 ---
 
 ## BRIEF
-[~100 words. Plain prose that states what the discussion was about, the conclusion reached, and the most important next step — all drawn strictly from the brief. No headers or bullet points. Apply the language rules above — no evaluative framing.]
+[~150 words. A concise factual overview: what the discussion was about, the main positions held by the team, and any conclusion reached. Plain prose, no headers or bullets. Written so it stands alone as a quick reference. Apply the language rules above — no evaluative framing.]
 
 ---
 
@@ -451,16 +603,16 @@ Target: approximately {word_count} words for the Detailed Summary. The Brief sho
 
 **HOW TO STRUCTURE THE DETAILED SUMMARY:**
 
-Step 1 — Identify the main topics discussed in this meeting from the intelligence brief. Let the topics emerge from the content — do not force it into a pre-defined skeleton. A typical internal discussion has 3–5 main topics (e.g. a problem being diagnosed, a proposal being evaluated, a process being debated).
+Step 1 — Identify the main topics or issues discussed from the intelligence brief. Let the topics emerge from the content — do not force it into a pre-defined skeleton. A typical internal discussion has 3–5 main topics.
 
 Step 2 — For each topic, write a **bold topic heading** followed by 2–4 sentences of factual prose. The prose should:
-- Group related facts from the brief into sentences rather than presenting each as an isolated bullet
-- Capture who said what only where the brief records attribution — do not attribute views not attributed in the brief
-- Include a direct quote from the brief inline if relevant (format: *"quote"*) — use the exact wording from the brief
-- Record agreement or disagreement only where the brief records it, using neutral phrasing ("X and Y agreed that...", "X held that..., while Y held that...")
+- Group related facts from the brief into sentences rather than presenting each fact as an isolated bullet
+- Weave data points, specific numbers, and named references in as part of sentences
+- Include a direct quote from the brief inline if one is relevant to this topic (format: *"quote"*) — use the exact wording from the brief
+- Where attribution exists in the brief, preserve it ("X argued that...", "Y held that...", "the team agreed that...") — do not invent attribution where the brief gives none
 - Only use connective language where the brief records the relationship
 
-Step 3 — If a topic has more than 3–4 distinct data points that would clutter prose, follow the prose with a compact indented list of those specifics only.
+Step 3 — If a topic has more than 3–4 distinct data points that are hard to weave into prose without cluttering it, follow the prose with a compact indented list of those specifics only.
 
 Step 4 — After all topic sections, add:
 
@@ -593,13 +745,68 @@ def get_model(display_name: str) -> genai.GenerativeModel:
     return cache[model_id]
 
 
-def generate_with_retry(model, prompt, max_retries: int = 3, stream: bool = False, generation_config=None):
+# ── Usage / cost tracking ──────────────────────────────────────────────────────
+# Every LLM call records its (input_tokens, output_tokens, model, stage) into the
+# session-state log. The cost panel reads this log to render a per-stage table and
+# a session-to-date dollar total. Tracking is best-effort: failures here NEVER
+# break the pipeline — see the broad except in _record_usage.
+
+def _record_usage(model_id: str, response, stage: str = "") -> None:
+    """Append a usage entry to st.session_state['usage_log']. Silent on any failure."""
+    try:
+        usage = getattr(response, "usage_metadata", None)
+        if usage is None:
+            return
+        input_tokens  = int(getattr(usage, "prompt_token_count", 0) or 0)
+        output_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
+        if input_tokens == 0 and output_tokens == 0:
+            return
+        log = st.session_state.setdefault("usage_log", [])
+        log.append({
+            "model":         model_id or "unknown",
+            "stage":         stage or "other",
+            "input_tokens":  input_tokens,
+            "output_tokens": output_tokens,
+        })
+    except Exception:
+        pass  # Tracking must never break the pipeline
+
+
+def compute_cost(input_tokens: int, output_tokens: int, model_id: str) -> float:
+    """USD cost for given token counts using the MODEL_PRICING table.
+    Returns 0.0 for unknown models (so the panel still renders, just without $)."""
+    pricing = MODEL_PRICING.get(model_id)
+    if not pricing:
+        return 0.0
+    in_price, out_price = pricing
+    return (input_tokens / 1_000_000) * in_price + (output_tokens / 1_000_000) * out_price
+
+
+def generate_with_retry(model, prompt, max_retries: int = 3, stream: bool = False,
+                        generation_config=None, stage: str = ""):
+    """Call the model with retry on transient errors. Records usage for non-streaming
+    responses; for streaming, tags the response so stream_and_collect can record
+    after iteration completes (usage_metadata is only finalised post-iteration)."""
     kwargs = {"stream": stream}
     if generation_config:
         kwargs["generation_config"] = generation_config
+    # google-generativeai prefixes model_name with "models/" — strip for pricing lookup
+    model_id = getattr(model, "model_name", "") or ""
+    if model_id.startswith("models/"):
+        model_id = model_id[len("models/"):]
     for attempt in range(max_retries):
         try:
-            return model.generate_content(prompt, **kwargs)
+            response = model.generate_content(prompt, **kwargs)
+            if not stream:
+                _record_usage(model_id, response, stage)
+            else:
+                # Tag the streaming response object so stream_and_collect can find it
+                try:
+                    response._tracked_model_id = model_id
+                    response._tracked_stage    = stage
+                except (AttributeError, TypeError):
+                    pass  # Some response types block dynamic attrs; tracking just skips
+            return response
         except Exception as e:
             err = str(e).lower()
             is_transient = any(k in err for k in ["429", "503", "500", "deadline", "timeout", "unavailable", "resource_exhausted"])
@@ -619,6 +826,11 @@ def stream_and_collect(response, placeholder=None) -> Tuple[str, int]:
                 placeholder.caption(f"Streaming… {len(full_text.split()):,} words")
     if placeholder:
         placeholder.empty()
+    # Record usage if generate_with_retry tagged the response on its way out
+    tracked_model = getattr(response, "_tracked_model_id", "")
+    tracked_stage = getattr(response, "_tracked_stage", "")
+    if tracked_model:
+        _record_usage(tracked_model, response, tracked_stage)
     tokens = 0
     try:
         if hasattr(response, "usage_metadata") and response.usage_metadata:
@@ -738,7 +950,7 @@ def transcribe_audio(audio_bytes: bytes, model, status_write, context: str = "",
                 cloud = genai.get_file(cloud.name)
             if cloud.state.name != "ACTIVE":
                 raise RuntimeError(f"Audio chunk {i+1} failed to process in the cloud.")
-            resp = generate_with_retry(model, [transcription_instruction, cloud])
+            resp = generate_with_retry(model, [transcription_instruction, cloud], stage="Transcription")
             transcripts.append(resp.text)
     finally:
         for p in local_paths:
@@ -768,7 +980,7 @@ def refine_transcript(raw: str, meeting_type: str, speakers: str, model, status_
             f"Label speakers clearly if possible. {speaker_info} {extra}\n{lang_instr}\n\n"
             f"TRANSCRIPT:\n{raw}"
         )
-        return generate_with_retry(model, prompt).text
+        return generate_with_retry(model, prompt, stage="Refinement").text
     chunks = create_chunks_with_overlap(raw, CHUNK_WORD_SIZE, CHUNK_WORD_OVERLAP)
     status_write(f"Refining transcript ({len(chunks)} chunks in parallel)…")
     prompts = []
@@ -789,7 +1001,7 @@ def refine_transcript(raw: str, meeting_type: str, speakers: str, model, status_
             )
     results = [None] * len(chunks)
     def _refine_one(idx, prompt):
-        return idx, generate_with_retry(model, prompt).text
+        return idx, generate_with_retry(model, prompt, stage="Refinement").text
     with ThreadPoolExecutor(max_workers=min(3, len(chunks))) as executor:
         futures = {executor.submit(_refine_one, i, p): i for i, p in enumerate(prompts)}
         done = 0
@@ -804,12 +1016,13 @@ def refine_transcript(raw: str, meeting_type: str, speakers: str, model, status_
 # ── 9. NOTES GENERATION ────────────────────────────────────────────────────────
 
 def _build_base_prompt(meeting_type: str, detail_level: str, extra_context: str) -> str:
+    detailed = detail_level == "Detailed"
     if meeting_type == "Expert Meeting":
-        base = EXPERT_MEETING_DETAILED_PROMPT if detail_level == "Detailed" else EXPERT_MEETING_CONCISE_PROMPT
+        base = EXPERT_MEETING_DETAILED_PROMPT if detailed else EXPERT_MEETING_CONCISE_PROMPT
     elif meeting_type == "Management Meeting":
-        base = MANAGEMENT_MEETING_PROMPT
+        base = MANAGEMENT_MEETING_DETAILED_PROMPT if detailed else MANAGEMENT_MEETING_CONCISE_PROMPT
     else:
-        base = INTERNAL_DISCUSSION_PROMPT
+        base = INTERNAL_DISCUSSION_DETAILED_PROMPT if detailed else INTERNAL_DISCUSSION_CONCISE_PROMPT
     if extra_context.strip():
         base += f"\n\n**ADDITIONAL CONTEXT PROVIDED:**\n{extra_context.strip()}"
     return base
@@ -822,7 +1035,7 @@ def generate_notes(transcript: str, meeting_type: str, detail_level: str, extra_
         status_write("Generating notes (single chunk)…")
         prompt = f"{base}\n\n**MEETING TRANSCRIPT:**\n{transcript}"
         ph = st.empty()
-        resp = generate_with_retry(model, prompt, stream=True, generation_config={"max_output_tokens": MAX_OUTPUT_TOKENS})
+        resp = generate_with_retry(model, prompt, stream=True, generation_config={"max_output_tokens": MAX_OUTPUT_TOKENS}, stage="Notes")
         notes, _ = stream_and_collect(resp, ph)
         return notes
     chunks = create_chunks_with_overlap(transcript, CHUNK_WORD_SIZE, CHUNK_WORD_OVERLAP)
@@ -837,7 +1050,7 @@ def generate_notes(transcript: str, meeting_type: str, detail_level: str, extra_
             context_package=context_package,
         )
         ph = st.empty()
-        resp = generate_with_retry(model, prompt, stream=True, generation_config={"max_output_tokens": MAX_OUTPUT_TOKENS})
+        resp = generate_with_retry(model, prompt, stream=True, generation_config={"max_output_tokens": MAX_OUTPUT_TOKENS}, stage="Notes")
         chunk_notes, _ = stream_and_collect(resp, ph)
         all_chunk_notes.append(chunk_notes)
         context_package = create_context_from_notes("\n\n".join(all_chunk_notes), i + 1)
@@ -879,14 +1092,14 @@ def extract_intelligence(notes: str, meeting_type: str, model, status_write) -> 
     # Single-chunk fast path
     if len(chunks) == 1:
         status_write("Extracting intelligence from notes…")
-        return generate_with_retry(model, base_prompt.format(notes=notes.strip())).text
+        return generate_with_retry(model, base_prompt.format(notes=notes.strip()), stage="Intelligence").text
 
     # Multi-chunk: extract in parallel, then synthesise
     status_write(f"Extracting intelligence from {len(chunks)} note sections in parallel…")
     extracts: list[str] = [""] * len(chunks)
 
     def _extract_one(idx: int, chunk_text: str) -> tuple[int, str]:
-        return idx, generate_with_retry(model, base_prompt.format(notes=chunk_text)).text
+        return idx, generate_with_retry(model, base_prompt.format(notes=chunk_text), stage="Intelligence").text
 
     with ThreadPoolExecutor(max_workers=min(3, len(chunks))) as executor:
         futures = {executor.submit(_extract_one, i, c): i for i, c in enumerate(chunks)}
@@ -900,7 +1113,7 @@ def extract_intelligence(notes: str, meeting_type: str, model, status_write) -> 
     status_write("Synthesising intelligence extracts…")
     combined = "\n\n---\n\n".join(f"[Section {i+1}/{len(chunks)}]\n{e}" for i, e in enumerate(extracts))
     synth_prompt = INTEL_SYNTHESIS_PROMPT.format(meeting_type=meeting_type, extracts=combined)
-    return generate_with_retry(model, synth_prompt).text
+    return generate_with_retry(model, synth_prompt, stage="Intelligence synthesis").text
 
 
 # ── 11. SUMMARY GENERATION ─────────────────────────────────────────────────────
@@ -922,7 +1135,7 @@ def generate_summary(intelligence: str, meeting_type: str, word_count: int, focu
         intelligence=intelligence.strip(),
     )
     ph = st.empty()
-    resp = generate_with_retry(model, prompt, stream=True)
+    resp = generate_with_retry(model, prompt, stream=True, stage="Summary")
     summary, _ = stream_and_collect(resp, ph)
     return summary
 
@@ -936,7 +1149,7 @@ def refine_summary(current_summary: str, intelligence: str, instruction: str, mo
         instruction=instruction,
     )
     ph = st.empty()
-    resp = generate_with_retry(model, prompt, stream=True)
+    resp = generate_with_retry(model, prompt, stream=True, stage="Summary refinement")
     revised, _ = stream_and_collect(resp, ph)
     return revised
 
@@ -1032,6 +1245,13 @@ def render_intelligence_panel(intelligence: str, meeting_type: str):
         "WHERE THERE WAS DISAGREEMENT":   "⚡",
         "CONCLUSIONS REACHED":            "✅",
         "NEXT STEPS":                     "→",
+        # New section headers used by the Q&A-format Management & Internal intel prompts.
+        # (Old headers above are kept for backward compatibility with any in-session briefs
+        # generated before the prompts were rewritten.)
+        "MANAGEMENT BACKGROUND":                            "👔",
+        "QUESTIONS & UNCERTAINTIES MANAGEMENT RAISED":      "❓",
+        "DISCUSSION CONTEXT":                               "📋",
+        "QUESTIONS & UNCERTAINTIES THE TEAM RAISED":        "❓",
     }
     # Parse sections and render with icons
     lines = intelligence.split("\n")
@@ -1047,10 +1267,68 @@ def render_intelligence_panel(intelligence: str, meeting_type: str):
     st.markdown("\n".join(output_lines))
 
 
+def render_usage_panel():
+    """Render a session-to-date usage & cost panel from st.session_state['usage_log'].
+    Displays per-stage breakdown (input tokens, output tokens, USD cost) plus a total.
+    Renders nothing if no LLM calls have been logged yet."""
+    log = st.session_state.get("usage_log", [])
+    if not log:
+        return
+
+    # Aggregate by stage, summing token counts and cost; track models used per stage
+    by_stage: dict = {}
+    total_in, total_out, total_cost = 0, 0, 0.0
+    for entry in log:
+        s     = entry["stage"] or "other"
+        model = entry["model"]
+        cost  = compute_cost(entry["input_tokens"], entry["output_tokens"], model)
+        slot  = by_stage.setdefault(s, {"input": 0, "output": 0, "cost": 0.0, "models": set()})
+        slot["input"]  += entry["input_tokens"]
+        slot["output"] += entry["output_tokens"]
+        slot["cost"]   += cost
+        slot["models"].add(model)
+        total_in   += entry["input_tokens"]
+        total_out  += entry["output_tokens"]
+        total_cost += cost
+
+    with st.expander(f"💰 Usage & cost — ~${total_cost:.4f} session-to-date", expanded=False):
+        st.caption(
+            "Approximate cost based on the hardcoded `MODEL_PRICING` table — verify against "
+            "your Google Cloud project's billing reports for authoritative numbers. "
+            "Audio input is billed at the text-input rate here (slight underestimate). "
+            "Resets when the app session restarts."
+        )
+        lines = [
+            "| Stage | Model(s) | Input tokens | Output tokens | Cost (USD) |",
+            "|---|---|---:|---:|---:|",
+        ]
+        for stage, vals in by_stage.items():
+            models = ", ".join(sorted(vals["models"]))
+            lines.append(
+                f"| {stage} | `{models}` | {vals['input']:,} | {vals['output']:,} | ${vals['cost']:.4f} |"
+            )
+        lines.append(
+            f"| **Total** | — | **{total_in:,}** | **{total_out:,}** | **${total_cost:.4f}** |"
+        )
+        st.markdown("\n".join(lines))
+        if st.button("Reset usage counter", key="reset_usage_btn"):
+            st.session_state.pop("usage_log", None)
+            st.rerun()
+
+
 # ── 13. PAGE: PROCESS ──────────────────────────────────────────────────────────
 
 def page_process():
     api_key_check()
+
+    # If the Transcribe page staged a transcript via the "Use in Process Meeting" button,
+    # pre-fill the Paste Text input here. The pop ensures this fires only on the first
+    # visit after staging — subsequent reruns don't re-clobber user edits.
+    staged = st.session_state.pop("staged_transcript_for_process", None)
+    if staged:
+        st.session_state["text_input"]   = staged
+        st.session_state["input_method"] = "Paste Text"
+
     st.header("Process Meeting")
 
     with st.sidebar:
@@ -1078,12 +1356,12 @@ def page_process():
 
     meeting_type = st.selectbox("Meeting type", MEETING_TYPES, key="meeting_type")
 
-    detail_level = "Concise"
-    if meeting_type == "Expert Meeting":
-        detail_level = st.radio(
-            "Note style", ["Concise", "Detailed"], horizontal=True, key="detail_level",
-            help="**Concise**: information-dense, no filler.  **Detailed**: maximum verbosity, zero omission."
-        )
+    # Concise vs Detailed now available for ALL meeting types — each type has its own
+    # Concise and Detailed prompt variant. Default ("Concise") is the first option.
+    detail_level = st.radio(
+        "Note style", ["Concise", "Detailed"], horizontal=True, key="detail_level",
+        help="**Concise**: information-dense, no filler.  **Detailed**: maximum verbosity, zero omission."
+    )
 
     with st.expander("Context & additional instructions", expanded=False):
         st.caption(
@@ -1240,6 +1518,8 @@ def page_process():
                 render_intelligence_panel(intelligence, meeting_type_label)
             else:
                 st.info("Run **Process Meeting** to generate the intelligence brief.")
+
+    render_usage_panel()
 
 
 # ── 14. PAGE: SUMMARY ──────────────────────────────────────────────────────────
@@ -1484,6 +1764,8 @@ def page_summary():
                     st.markdown(d)
                     copy_button(entry["summary"], f"Copy v{entry['version']}")
 
+    render_usage_panel()
+
 
 # ── 15. PAGE: ANALYSE ──────────────────────────────────────────────────────────
 
@@ -1492,7 +1774,7 @@ def run_analysis(intelligence: str, question: str, model, status_write) -> str:
     status_write("Analysing…")
     prompt = ANALYSIS_PROMPT.format(intelligence=intelligence.strip(), question=question.strip())
     ph = st.empty()
-    resp = generate_with_retry(model, prompt, stream=True)
+    resp = generate_with_retry(model, prompt, stream=True, stage="Analysis")
     result, _ = stream_and_collect(resp, ph)
     return result
 
@@ -1586,7 +1868,8 @@ def page_analyse():
                 try:
                     raw = generate_with_retry(
                         analysis_model,
-                        QUESTION_SUGGESTION_PROMPT.format(intelligence=suggestion_source)
+                        QUESTION_SUGGESTION_PROMPT.format(intelligence=suggestion_source),
+                        stage="Suggest questions",
                     ).text
                     questions = [
                         re.sub(r'^\s*\d+[\.\)]\s*', '', line).strip()
@@ -1633,7 +1916,7 @@ def page_analyse():
                 )
                 status_ph.info("⏳ Searching notes for an answer…")
                 ph = st.empty()
-                resp = generate_with_retry(analysis_model, prompt, stream=True)
+                resp = generate_with_retry(analysis_model, prompt, stream=True, stage="Analysis")
                 result, _ = stream_and_collect(resp, ph)
                 status_ph.empty()
             else:
@@ -1679,16 +1962,205 @@ def page_analyse():
             st.session_state.pop("analysis_history", None)
             st.rerun()
 
+    render_usage_panel()
 
-# ── 16. MAIN ───────────────────────────────────────────────────────────────────
+
+# ── 16. PAGE: TRANSCRIBE ───────────────────────────────────────────────────────
+# Audio-only workflow: upload/record audio → raw transcript → optional refined transcript.
+# Does NOT run notes generation, intelligence extraction, or summary — for use cases where
+# the user just needs a usable transcript to take elsewhere (e.g. paste into another tool,
+# share with a colleague, archive for the record).
+
+def page_transcribe():
+    api_key_check()
+    st.header("Transcribe")
+    st.caption(
+        "Upload audio and get a usable transcript — without running the full notes pipeline. "
+        "Useful when you just need the words for something else."
+    )
+
+    with st.sidebar:
+        st.markdown("### Model Settings")
+        transcription_model_name = st.selectbox(
+            "Transcription model", list(MODELS.keys()), index=3,
+            key="t_transcription_model", help="Audio-to-text."
+        )
+        refine_model_name = st.selectbox(
+            "Refinement model", list(MODELS.keys()), index=1,
+            key="t_refine_model", help="Transcript clean-up pass."
+        )
+        refine_enabled = st.toggle(
+            "Enable refinement pass", value=True, key="t_refine_toggle",
+            help="Fixes grammar, labels speakers where possible, translates Hindi/Hinglish into English."
+        )
+
+    with st.expander("Context (optional — improves transcription accuracy on names/terms)", expanded=False):
+        speakers = st.text_input(
+            "Speaker names (comma-separated)", key="t_speakers",
+            placeholder="e.g. John Smith, Dr. Patel, Priya Krishnan"
+        )
+        extra_context = st.text_area(
+            "Background / domain terms", height=80, key="t_extra_context",
+            placeholder="e.g. Call on Indian cement sector. Key companies: UltraTech, Shree Cement."
+        )
+
+    extra_context_combined = "\n".join(filter(None, [
+        f"Speakers: {speakers}" if speakers.strip() else "",
+        extra_context.strip(),
+    ]))
+
+    st.divider()
+    input_method = st.radio(
+        "Audio source",
+        ["Upload File", "Record Audio"],
+        horizontal=True, key="t_input_method",
+    )
+
+    audio_bytes: Optional[bytes] = None
+    audio_ext: str = ".audio"
+    source_filename: str = "transcript"
+
+    if input_method == "Upload File":
+        uploaded = st.file_uploader(
+            "Upload an audio file",
+            type=["wav", "mp3", "m4a", "ogg", "flac", "mp4", "mov"],
+            key="t_uploaded_file",
+        )
+        if uploaded:
+            size_mb = uploaded.size / (1024 * 1024)
+            if size_mb > MAX_AUDIO_MB:
+                st.error(f"Audio file too large ({size_mb:.1f} MB). Limit: {MAX_AUDIO_MB} MB.")
+            else:
+                audio_bytes = uploaded.getvalue()
+                audio_ext = os.path.splitext(uploaded.name)[1].lower()
+                source_filename = os.path.splitext(uploaded.name)[0] or "transcript"
+                st.info(f"Audio loaded: **{uploaded.name}** ({size_mb:.1f} MB)")
+    else:
+        st.caption("Click the microphone to start recording. Click again to stop.")
+        recording = st.audio_input("Record a voice note", key="t_audio_recording")
+        if recording:
+            audio_bytes = recording.getvalue()
+            audio_ext = ".webm"
+            source_filename = "recording"
+            st.success("Recording captured. Click **Transcribe** when ready.")
+
+    st.divider()
+    if st.button("Transcribe", type="primary", use_container_width=True):
+        if not audio_bytes:
+            st.error("Please upload or record an audio file first.")
+            st.stop()
+
+        transcr_model = get_model(transcription_model_name)
+        refine_model  = get_model(refine_model_name)
+
+        with st.status("Transcribing…", expanded=True) as status:
+            try:
+                raw_transcript = transcribe_audio(
+                    audio_bytes, transcr_model, st.write,
+                    context=extra_context_combined, file_ext=audio_ext,
+                )
+                if not raw_transcript or not raw_transcript.strip():
+                    raise ValueError("Transcription returned empty output.")
+                st.write(f"✓ Raw transcription complete: **{len(raw_transcript.split()):,} words**")
+
+                refined_transcript = ""
+                if refine_enabled:
+                    # Empty meeting_type → refine_transcript skips the meeting-type-specific
+                    # instruction and just does grammar / speaker-labelling / translation.
+                    refined_transcript = refine_transcript(
+                        raw_transcript, "", speakers, refine_model, st.write,
+                    )
+                    st.write(f"✓ Refined transcript complete: **{len(refined_transcript.split()):,} words**")
+
+                st.session_state["t_raw_transcript"]     = raw_transcript
+                st.session_state["t_refined_transcript"] = refined_transcript
+                st.session_state["t_source_filename"]    = source_filename
+
+                status.update(label="Done!", state="complete")
+            except Exception as e:
+                status.update(label="Failed", state="error")
+                st.error(f"**Error:** {e}")
+
+    # ── Output ─────────────────────────────────────────────────────────────────
+    if "t_raw_transcript" in st.session_state:
+        st.divider()
+        raw      = st.session_state["t_raw_transcript"]
+        refined  = st.session_state.get("t_refined_transcript", "")
+        filename = st.session_state.get("t_source_filename", "transcript")
+
+        if refined:
+            # Refined first (most users will want the clean version)
+            tab_refined, tab_raw = st.tabs(["✨ Refined Transcript", "📄 Raw Transcript"])
+
+            with tab_refined:
+                col_title, col_copy, col_dl = st.columns([2, 1, 1])
+                with col_title:
+                    st.subheader(f"Refined Transcript  ({len(refined.split()):,} words)")
+                with col_copy:
+                    copy_button(refined, "Copy")
+                with col_dl:
+                    st.download_button(
+                        "Download .txt", data=refined,
+                        file_name=f"{filename}_refined.txt", mime="text/plain",
+                        use_container_width=True, key="dl_refined",
+                    )
+                st.markdown(refined)
+                if st.button("→ Use this refined transcript in Process Meeting",
+                             key="use_refined_in_process", use_container_width=True):
+                    st.session_state["staged_transcript_for_process"] = refined
+                    st.switch_page(PAGE_PROCESS)
+
+            with tab_raw:
+                col_title, col_copy, col_dl = st.columns([2, 1, 1])
+                with col_title:
+                    st.subheader(f"Raw Transcript  ({len(raw.split()):,} words)")
+                with col_copy:
+                    copy_button(raw, "Copy")
+                with col_dl:
+                    st.download_button(
+                        "Download .txt", data=raw,
+                        file_name=f"{filename}_raw.txt", mime="text/plain",
+                        use_container_width=True, key="dl_raw",
+                    )
+                st.markdown(raw)
+                if st.button("→ Use this raw transcript in Process Meeting",
+                             key="use_raw_in_process", use_container_width=True):
+                    st.session_state["staged_transcript_for_process"] = raw
+                    st.switch_page(PAGE_PROCESS)
+        else:
+            col_title, col_copy, col_dl = st.columns([2, 1, 1])
+            with col_title:
+                st.subheader(f"Transcript  ({len(raw.split()):,} words)")
+            with col_copy:
+                copy_button(raw, "Copy")
+            with col_dl:
+                st.download_button(
+                    "Download .txt", data=raw,
+                    file_name=f"{filename}.txt", mime="text/plain",
+                    use_container_width=True, key="dl_raw_only",
+                )
+            st.markdown(raw)
+            if st.button("→ Use this transcript in Process Meeting",
+                         key="use_raw_only_in_process", use_container_width=True):
+                st.session_state["staged_transcript_for_process"] = raw
+                st.switch_page(PAGE_PROCESS)
+
+    render_usage_panel()
+
+
+# ── 17. MAIN ───────────────────────────────────────────────────────────────────
+
+# Page objects are defined at module scope so st.switch_page() can reference them
+# (used by the "Use in Process Meeting →" button on the Transcribe page output).
+PAGE_PROCESS    = st.Page(page_process,    title="Process Meeting", icon=":material/edit_note:")
+PAGE_SUMMARY    = st.Page(page_summary,    title="Summary",         icon=":material/summarize:")
+PAGE_ANALYSE    = st.Page(page_analyse,    title="Analyse",         icon=":material/psychology:")
+PAGE_TRANSCRIBE = st.Page(page_transcribe, title="Transcribe",      icon=":material/mic:")
+
 
 def main():
     st.set_page_config(page_title="SynthNotes Pro", layout="wide", page_icon="★")
-    nav = st.navigation([
-        st.Page(page_process, title="Process Meeting", icon=":material/edit_note:"),
-        st.Page(page_summary, title="Summary",         icon=":material/summarize:"),
-        st.Page(page_analyse, title="Analyse",         icon=":material/psychology:"),
-    ])
+    nav = st.navigation([PAGE_PROCESS, PAGE_SUMMARY, PAGE_ANALYSE, PAGE_TRANSCRIBE])
     nav.run()
 
 
