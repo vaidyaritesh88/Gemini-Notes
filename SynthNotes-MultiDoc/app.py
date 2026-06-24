@@ -176,6 +176,92 @@ Now produce the final consolidated document. Begin immediately with the document
 """
 
 
+OUTLINE_PROMPT = """You are designing the STRUCTURE of a consolidated document that synthesises notes from multiple source documents. This is the **planning step** — you will NOT write the document yet.
+
+### USER'S INSTRUCTIONS (defines what the document is)
+{user_prompt}
+
+### TARGET LENGTH
+**~{target_word_count} words total**. Section word budgets MUST sum to approximately this number.
+
+### CHRONOLOGY DIRECTIVE
+The notes below come from **{num_files} source document(s)**. Examine the content for date markers, fiscal years, quarters (Q1/Q2/Q3/Q4), sequence references, and contextual ordering. If chronology is inferable, order sections chronologically. If not, group by topic.
+
+### SOURCE DOCUMENTS
+{filename_list}
+
+### PER-SECTION NOTES
+{combined_notes}
+
+---
+
+### YOUR TASK
+Produce a structured outline of the final document. Use EXACTLY this format:
+
+# [Document Title — chosen by you to fit the user's instructions]
+
+## [Section 1 heading]
+- Coverage: [1–2 sentence description of what this section covers, including which source notes it draws from]
+- Word budget: ~[N] words
+
+## [Section 2 heading]
+- Coverage: [...]
+- Word budget: ~[N] words
+
+(continue for all sections)
+
+TOTAL: ~[sum of all section budgets — must be close to {target_word_count}] words
+CHRONOLOGY_NOTE: [one sentence about how sections are ordered, e.g. "Sections are in chronological order from Q1 2023 to Q4 2024" OR "Chronology could not be inferred; sections are organised by topic."]
+
+### RULES
+1. Section count: typically **5–10 sections**, scaled to content and length target. With ~{target_word_count} words and dense source material, lean toward more sections (8–10) rather than fewer.
+2. Word budgets MUST sum to approximately **{target_word_count}** (±10%).
+3. Each section should be coherent, self-contained, and cover distinct material (no overlap between sections).
+4. Section headings should reflect the user's instructions in form and tone.
+5. Do NOT write any prose body — only the outline structure.
+6. The COVERAGE line for each section should be specific enough that a separate writer could write JUST that section knowing only its coverage description and the source notes.
+
+Produce the outline now. Begin immediately with `# [title]`.
+"""
+
+
+SECTION_PROMPT = """You are writing ONE SECTION of a larger consolidated document. Other sections are being written separately — your job is to write your section well.
+
+### USER'S ORIGINAL INSTRUCTIONS (context — what the final document is)
+{user_prompt}
+
+### THIS SECTION'S ASSIGNMENT
+**Heading**: {section_heading}
+**Coverage**: {section_coverage}
+**Word budget**: approximately **{section_word_budget} words**
+**Position**: section {section_n} of {total_sections}
+
+### FULL DOCUMENT OUTLINE (for context — DO NOT cover material assigned to other sections)
+{outline_text}
+
+### LENGTH COMPLIANCE — IMPORTANT
+Aim for **~{section_word_budget} words**. This is a firm target, not a suggestion:
+- If your natural draft is much shorter, you are under-using the source notes — go back to the notes below and pull more substantive detail until you hit the budget.
+- If your draft is significantly longer, you may be covering material that belongs in OTHER sections — trim to your assigned coverage scope.
+
+### CONTENT RULES
+1. **Stay strictly within your section's coverage scope.** The outline above lists other sections — their material is theirs, not yours.
+2. Use ONLY information from the per-section notes below — no external knowledge, no inference.
+3. Preserve hard data (numbers, percentages, dates, named entities, monetary values, named geographies) from the source notes.
+4. Apply the user's instructions for formatting (prose, bullets, sub-headings) within this section.
+5. Begin your output with the heading line exactly: `## {section_heading}`
+6. Do NOT include preamble like "This section covers…" — start with content immediately after the heading.
+7. Do NOT include a conclusion that summarises other sections — the final document has its own flow.
+
+### PER-SECTION NOTES (full set — extract content relevant to YOUR section)
+{combined_notes}
+
+---
+
+Write your assigned section now. Start with `## {section_heading}` and produce only the section body.
+"""
+
+
 INTERMEDIATE_REDUCE_PROMPT = """You are compressing a BATCH of per-section notes into a denser intermediate summary that will be combined with other batches in a later step.
 
 **This is NOT the final document.** Your output will be one of several intermediate summaries that get synthesised together later. Preserve information richly; the final compression happens downstream.
@@ -442,6 +528,174 @@ def _final_reduce(
     return text
 
 
+# ── Plan-then-write final synthesis ────────────────────────────────────────────
+# Instead of asking the model to produce a 6000-word document in one shot (where
+# LLMs reliably under-comply on length), we do it in two stages:
+#   1. Outline pass: the model proposes a section-by-section plan with per-section
+#      word budgets. Chronology is decided here, once.
+#   2. Write pass: each section is written in parallel by a separate LLM call,
+#      receiving the full outline (so it knows what other sections cover) and
+#      the full notes (so it can extract what's relevant).
+# Net effect: each section's small word target is reliably hit (LLMs nail small
+# targets), so the global target is reliably hit too. Trade-off: 2–4× more LLM
+# calls than single-pass reduce.
+
+def _generate_outline(
+    combined_notes: str, filenames: List[str], user_prompt: str,
+    target_word_count: int, model,
+) -> str:
+    """Plan stage — ask the model to propose a section-by-section outline."""
+    prompt = OUTLINE_PROMPT.format(
+        user_prompt=user_prompt.strip(),
+        target_word_count=target_word_count,
+        num_files=len(filenames),
+        filename_list="\n".join(f"- {f}" for f in filenames),
+        combined_notes=combined_notes,
+    )
+    resp = generate_with_retry(model, prompt, stage="Plan (outline)")
+    return resp.text
+
+
+def _parse_outline(outline_text: str) -> List[dict]:
+    """Extract sections from the outline text. Returns a list of dicts:
+    [{'heading': str, 'coverage': str, 'budget': int}, ...]
+
+    Robust to minor format variations from the model. Returns [] if parsing
+    fails (caller should fall back to single-pass reduce in that case)."""
+    sections = []
+    current: Optional[dict] = None
+
+    for raw_line in outline_text.split("\n"):
+        line = raw_line.strip()
+        # New section starts on a '## ' heading (NOT '# ' which is the document title)
+        if line.startswith("## "):
+            if current and current.get("heading"):
+                sections.append(current)
+            current = {"heading": line[3:].strip(), "coverage": "", "budget": 0}
+        elif current is not None:
+            # Coverage line
+            cov_match = re.match(r"-\s*Coverage\s*:\s*(.+)$", line, re.IGNORECASE)
+            if cov_match:
+                current["coverage"] = cov_match.group(1).strip()
+                continue
+            # Word budget line — extract first number
+            bud_match = re.match(r"-\s*Word\s*budget\s*:\s*(.+)$", line, re.IGNORECASE)
+            if bud_match:
+                num = re.search(r"(\d+)", bud_match.group(1))
+                if num:
+                    current["budget"] = int(num.group(1))
+                continue
+
+    if current and current.get("heading"):
+        sections.append(current)
+
+    # Filter out malformed sections (no budget set)
+    return [s for s in sections if s["heading"] and s["budget"] > 0]
+
+
+def _extract_outline_metadata(outline_text: str) -> Tuple[Optional[str], Optional[str]]:
+    """Extract the document title (# heading) and the CHRONOLOGY_NOTE line, if present."""
+    title = None
+    title_match = re.search(r"^#\s+(.+?)$", outline_text, re.MULTILINE)
+    if title_match:
+        title = title_match.group(1).strip()
+        # Don't mistake a `## section` heading for the title
+        if title.startswith("#"):
+            title = None
+
+    chrono = None
+    chrono_match = re.search(r"CHRONOLOGY_NOTE\s*:\s*(.+?)$", outline_text, re.MULTILINE)
+    if chrono_match:
+        chrono = chrono_match.group(1).strip()
+
+    return title, chrono
+
+
+def _write_section(
+    section: dict, section_n: int, total_sections: int,
+    outline_text: str, combined_notes: str,
+    user_prompt: str, model,
+) -> str:
+    """Write stage — generate ONE section per the outline's assignment."""
+    prompt = SECTION_PROMPT.format(
+        user_prompt=user_prompt.strip(),
+        section_heading=section["heading"],
+        section_coverage=section.get("coverage", "(no specific coverage stated)"),
+        section_word_budget=section.get("budget", 500),
+        section_n=section_n,
+        total_sections=total_sections,
+        outline_text=outline_text,
+        combined_notes=combined_notes,
+    )
+    resp = generate_with_retry(model, prompt, stage="Write (section)")
+    return resp.text
+
+
+def plan_then_write_final(
+    notes_list: List[str], filenames: List[str], user_prompt: str,
+    target_word_count: int, model, status_write,
+) -> str:
+    """Final synthesis via plan-then-write pattern: outline → parallel sections → stitch.
+    Falls back to single-pass _final_reduce if the outline can't be parsed."""
+    combined_notes = "\n\n".join(notes_list)
+
+    # ── Step 1: Plan ───────────────────────────────────────────────────────────
+    status_write(f"📋 PLAN stage — generating outline for ~{target_word_count}-word document…")
+    outline_text = _generate_outline(combined_notes, filenames, user_prompt, target_word_count, model)
+    sections = _parse_outline(outline_text)
+
+    if not sections:
+        status_write("⚠️  Could not parse outline — falling back to single-pass synthesis")
+        return _final_reduce(notes_list, filenames, user_prompt, target_word_count, model, status_write)
+
+    title, chronology_note = _extract_outline_metadata(outline_text)
+    total_budget = sum(s["budget"] for s in sections)
+    status_write(
+        f"📋 Outline: **{len(sections)} sections**, total budget {total_budget:,} words"
+        + (f", title: '{title}'" if title else "")
+    )
+
+    # ── Step 2: Write (parallel per-section generation) ───────────────────────
+    status_write(f"✏️  WRITE stage — generating {len(sections)} sections in parallel…")
+    results: List[Optional[str]] = [None] * len(sections)
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                _write_section, section, i + 1, len(sections),
+                outline_text, combined_notes, user_prompt, model,
+            ): i
+            for i, section in enumerate(sections)
+        }
+        done = 0
+        for fut in as_completed(futures):
+            i = futures[fut]
+            results[i] = fut.result()
+            done += 1
+            wc = len(results[i].split()) if results[i] else 0
+            s = sections[i]
+            status_write(
+                f"  • Section {done}/{len(sections)}: '{s['heading']}' "
+                f"({wc:,} words written, budget was ~{s['budget']:,})"
+            )
+
+    # ── Step 3: Stitch ─────────────────────────────────────────────────────────
+    body_parts = [r.strip() for r in results if r and r.strip()]
+    document_parts: List[str] = []
+    if title:
+        document_parts.append(f"# {title}")
+    if chronology_note:
+        document_parts.append(f"*{chronology_note}*")
+    document_parts.extend(body_parts)
+
+    stitched = "\n\n".join(document_parts)
+    actual_words = len(stitched.split())
+    status_write(
+        f"✓ Plan-then-write complete — **{actual_words:,} words** "
+        f"({actual_words / target_word_count * 100:.0f}% of {target_word_count:,}-word target)"
+    )
+    return stitched
+
+
 def _intermediate_reduce(
     notes_batch: List[str], user_prompt: str,
     target_words: int, reduce_model, depth: int,
@@ -498,10 +752,13 @@ def hierarchical_reduce(
 
     if fits_in_one_call:
         if depth == 0:
-            status_write(f"Synthesising final document directly (~{total_words:,} words of input, fits in one call)…")
+            status_write(f"Notes fit in one synthesis pass (~{total_words:,} words). Starting plan-then-write…")
         else:
-            status_write(f"[Depth {depth}] Final synthesis from {len(notes_list)} intermediate summary(ies), ~{total_words:,} words…")
-        return _final_reduce(notes_list, filenames, user_prompt, target_word_count, reduce_model, status_write)
+            status_write(f"[Depth {depth}] Notes fit in one synthesis pass (~{total_words:,} words after compression). Starting plan-then-write…")
+        # Plan-then-write: produces a structured outline, then writes each section in parallel.
+        # More reliable length compliance than single-pass synthesis; also generally higher quality.
+        # Falls back to single-pass _final_reduce internally if the outline can't be parsed.
+        return plan_then_write_final(notes_list, filenames, user_prompt, target_word_count, reduce_model, status_write)
 
     if depth >= MAX_REDUCE_DEPTH:
         raise ValueError(
