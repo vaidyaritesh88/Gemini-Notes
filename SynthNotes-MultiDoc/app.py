@@ -447,6 +447,61 @@ def compute_cost(input_tokens: int, output_tokens: int, model_id: str) -> float:
     return (input_tokens / 1_000_000) * in_price + (output_tokens / 1_000_000) * out_price
 
 
+# ── Pre-flight cost estimation ─────────────────────────────────────────────────
+# Rough estimate shown to the user BEFORE the run, so they can sanity-check
+# expected spend at current input size and model selection. Real cost typically
+# lands within ±30% of this — the biggest uncertainty is per-chunk Map output
+# verbosity, which depends heavily on the user prompt's verbosity requirements.
+
+_TOKENS_PER_WORD_EST = 1.4  # mixed prose with light tagging tokenises slightly above 1
+
+
+def estimate_pipeline_cost(
+    total_input_words: int, target_word_count: int,
+    map_model_id: str, reduce_model_id: str,
+):
+    """Estimate per-stage cost in USD for a full MultiDoc pipeline run.
+
+    Architecture being estimated:
+      - Map: N parallel chunk calls (cheap model)
+      - Outline: 1 call receiving full Map output (quality model)
+      - Section writing: ~8 parallel section calls, each receiving full Map
+        output + outline (quality model). MultiDoc does NOT yet route by section,
+        so this is the cost amplifier; reflected in the estimate.
+    """
+    chunk_size, overlap = compute_chunk_params(target_word_count)
+    step = chunk_size - overlap
+    n_chunks = max(1, (total_input_words + step - 1) // step) if total_input_words else 0
+
+    # Map stage
+    prompt_overhead_words = 1100      # user prompt + wrapper template
+    map_in_tokens  = int(n_chunks * (chunk_size + prompt_overhead_words) * _TOKENS_PER_WORD_EST)
+    map_out_tokens = int(n_chunks * 2000 * _TOKENS_PER_WORD_EST)
+    map_cost = compute_cost(map_in_tokens, map_out_tokens, map_model_id)
+
+    # Outline pass — single call, all Map output as input
+    outline_in_tokens  = map_out_tokens + int(500 * _TOKENS_PER_WORD_EST)
+    outline_out_tokens = int(500 * _TOKENS_PER_WORD_EST)
+    outline_cost = compute_cost(outline_in_tokens, outline_out_tokens, reduce_model_id)
+
+    # Section writing — typical ~8 parallel sections; each receives the FULL Map
+    # output (no section-routing in MultiDoc yet, unlike FactbaseNote).
+    n_sections = 8
+    section_in_per_call = map_out_tokens + int((500 + 800) * _TOKENS_PER_WORD_EST)
+    section_total_in    = n_sections * section_in_per_call
+    section_total_out   = int(target_word_count * _TOKENS_PER_WORD_EST)
+    section_cost = compute_cost(section_total_in, section_total_out, reduce_model_id)
+
+    return {
+        "n_chunks":     n_chunks,
+        "chunk_size":   chunk_size,
+        "map_cost":     map_cost,
+        "outline_cost": outline_cost,
+        "section_cost": section_cost,
+        "total_cost":   map_cost + outline_cost + section_cost,
+    }
+
+
 def generate_with_retry(model, prompt, max_retries: int = 3, stream: bool = False,
                         generation_config=None, stage: str = ""):
     """Call the model with retry on transient errors and auto-record usage."""
@@ -1156,6 +1211,42 @@ def main():
         f"**{overlap}-word overlap** between sections. "
         f"Smaller targets use larger chunks (more compression); larger targets use smaller chunks (more granular extraction)."
     )
+
+    # ── Pre-flight cost estimate ───────────────────────────────────────────────
+    # Source-files mode only (interim mode skips Map and costs much less).
+    if not is_interim_mode and uploaded:
+        total_input_words = sum(
+            len(f.getvalue().decode("utf-8", errors="replace").split()) for f in uploaded
+        )
+        map_model_id    = MODELS.get(map_model_name, "gemini-2.5-flash")
+        reduce_model_id = MODELS.get(reduce_model_name, "gemini-2.5-pro")
+        est = estimate_pipeline_cost(
+            total_input_words, word_count, map_model_id, reduce_model_id,
+        )
+        with st.expander(
+            f"💰 Estimated cost for this run: **~${est['total_cost']:.2f}**",
+            expanded=False,
+        ):
+            st.caption(
+                "Rough estimate at current input size and model selection. Plan-then-write "
+                "synthesis (Map → Outline → ~8 section calls). Actual cost typically lands "
+                "within ±30% — biggest variable is per-chunk Map output verbosity. "
+                "Section writing dominates because each section call currently receives the "
+                "full Map output (a known cost amplifier worth fixing later)."
+            )
+            cost_lines = [
+                "| Stage | Model | Est. cost (USD) |",
+                "|---|---|---:|",
+                f"| Map ({est['n_chunks']:,} chunks @ {est['chunk_size']:,}-word chunks) | `{map_model_id}` | ${est['map_cost']:.4f} |",
+                f"| Outline (1 call, all Map output) | `{reduce_model_id}` | ${est['outline_cost']:.4f} |",
+                f"| Section writing (~8 sections, full Map output each) | `{reduce_model_id}` | ${est['section_cost']:.4f} |",
+                f"| **Total** | — | **${est['total_cost']:.4f}** |",
+            ]
+            st.markdown("\n".join(cost_lines))
+            st.caption(
+                f"Input scale: {total_input_words:,} words across {len(uploaded)} file(s). "
+                f"Cost scales roughly linearly with input size; doubles input → roughly doubles cost."
+            )
 
     # ── Process ────────────────────────────────────────────────────────────────
     st.divider()
