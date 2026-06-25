@@ -109,13 +109,27 @@ def compute_chunk_params(target_word_count: int) -> Tuple[int, int]:
 
 
 # ── Extraction-stage chunk sizes ───────────────────────────────────────────────
-# Extraction is mechanical classification (keep vs skip) — bigger chunks give the
-# model more section context to make good keep/skip judgements, and produce fewer
-# total chunks (lower cost). Different defaults per source type.
-EXTRACTION_CHUNK_SIZE_AR        = 8000
-EXTRACTION_CHUNK_OVERLAP_AR     = 500
-EXTRACTION_CHUNK_SIZE_TRANSCRIPT    = 4000
-EXTRACTION_CHUNK_OVERLAP_TRANSCRIPT = 400
+# We deliberately use VERY large chunks for extraction. Reasoning:
+#   - Gemini's 1M-token context window easily fits an entire AR (~200K-300K words)
+#   - Fewer chunks = fewer LLM calls = dramatically lower wall-clock latency
+#   - Output token cap (65K) is what forces SOME chunking on the largest ARs;
+#     at ~30% retention, an 80K-word chunk's extract ≈ 24K words = ~34K tokens,
+#     fits comfortably in the output budget with headroom
+#   - create_chunks_with_overlap returns a SINGLE chunk when the file is smaller
+#     than chunk_size — so small files (typical transcripts, small ARs) become
+#     one LLM call automatically. That's the "adaptive" behaviour for free.
+#
+# Result: a 30K-word transcript → 1 chunk; a 60K-word AR → 1 chunk;
+#         a 150K-word AR → 2 chunks; a 250K-word AR → 4 chunks.
+EXTRACTION_CHUNK_SIZE_AR        = 80_000
+EXTRACTION_CHUNK_OVERLAP_AR     = 2_000
+EXTRACTION_CHUNK_SIZE_TRANSCRIPT    = 30_000
+EXTRACTION_CHUNK_OVERLAP_TRANSCRIPT = 1_000
+
+# Extraction stage uses its own worker pool size. Flash-Lite has high rate limits
+# (4000 RPM, 4M TPM on paid tier) and extraction calls don't depend on each other,
+# so we parallelise more aggressively than the synthesis Map stage.
+EXTRACTION_PARALLEL_WORKERS = 6
 
 # Marker the extraction prompt is told to emit when a chunk has nothing worth
 # keeping. We use this to filter empty chunks from the combined extract.
@@ -802,42 +816,72 @@ def extract_pass(
 ) -> List[Tuple[str, str]]:
     """Run extraction on a list of (filename, content) files. Returns a list of
     (filename, extracted_content) tuples — same shape as input, ready to feed
-    downstream Map stage. Files with no retained content are dropped (with a warning)."""
+    downstream Map stage. Files with no retained content are dropped (with a warning).
+
+    Global parallelism: builds a flat task list of ALL chunks across ALL files,
+    then dispatches them to one worker pool. Massively faster than per-file
+    sequential processing when chunks-per-file varies (which it always does).
+    Files are reconstructed in order at the end via (file_idx, chunk_idx) keys.
+
+    Chunk sizing is adaptive automatically — create_chunks_with_overlap returns
+    a single chunk when len(words) <= chunk_size, so small files become single
+    LLM calls without any branching here.
+    """
     if not files:
         return []
 
-    out: List[Tuple[str, str]] = []
-    for filename, content in files:
+    # ── Build flat task list across all files ──────────────────────────────────
+    # Each task: (file_idx, chunk_idx, chunk_text, filename, total_chunks_in_file)
+    tasks: List[Tuple[int, int, str, str, int]] = []
+    per_file_chunk_counts: List[int] = []
+    for file_idx, (filename, content) in enumerate(files):
         chunks = create_chunks_with_overlap(content, chunk_size, overlap)
-        n = len(chunks)
-        status_write(f"  {source_type_label}: extracting {filename} ({n} chunk(s))")
+        per_file_chunk_counts.append(len(chunks))
+        for chunk_idx, chunk_text in enumerate(chunks):
+            tasks.append((file_idx, chunk_idx, chunk_text, filename, len(chunks)))
 
-        per_chunk_outputs: List[Optional[str]] = [None] * n
-        with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
-            futures = {
-                executor.submit(
-                    _extract_one_chunk, chunk_text, i + 1, n, filename,
-                    extraction_prompt, model,
-                ): i
-                for i, chunk_text in enumerate(chunks)
-            }
-            done = 0
-            for fut in as_completed(futures):
-                i = futures[fut]
-                per_chunk_outputs[i] = fut.result()
-                done += 1
-                status_write(f"    • {filename}: {done}/{n} chunks done")
+    n_total = len(tasks)
+    # Per-file chunk-count log (shows adaptive sizing — small files → 1 chunk)
+    chunk_summary = ", ".join(
+        f"{files[i][0]} → {per_file_chunk_counts[i]}"
+        for i in range(len(files))
+    )
+    status_write(
+        f"  {source_type_label}: {len(files)} file(s) → {n_total} chunk(s) total "
+        f"(parallel × {EXTRACTION_PARALLEL_WORKERS}). Per-file: {chunk_summary}"
+    )
 
-        # Filter out skip markers and empty results; keep order
+    # ── Process all chunks in one global parallel pool ─────────────────────────
+    results: dict = {}  # (file_idx, chunk_idx) → extracted_text
+    with ThreadPoolExecutor(max_workers=EXTRACTION_PARALLEL_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                _extract_one_chunk, chunk_text, chunk_idx + 1, total_in_file,
+                filename, extraction_prompt, model,
+            ): (file_idx, chunk_idx, filename)
+            for file_idx, chunk_idx, chunk_text, filename, total_in_file in tasks
+        }
+        done = 0
+        for fut in as_completed(futures):
+            file_idx, chunk_idx, filename = futures[fut]
+            results[(file_idx, chunk_idx)] = fut.result()
+            done += 1
+            status_write(f"    • {source_type_label}: {done}/{n_total} chunk(s) done")
+
+    # ── Group results back by file, preserve chunk order, filter skip markers ──
+    out: List[Tuple[str, str]] = []
+    for file_idx, (filename, content) in enumerate(files):
+        n_chunks = per_file_chunk_counts[file_idx]
         kept = []
-        for o in per_chunk_outputs:
-            if not o or not o.strip():
+        for chunk_idx in range(n_chunks):
+            output = results.get((file_idx, chunk_idx))
+            if not output or not output.strip():
                 continue
-            # Treat as skipped if the chunk's whole output is the skip marker
-            stripped = o.strip()
+            stripped = output.strip()
+            # Skip if the chunk's whole output is the skip marker
             if stripped == EXTRACTION_SKIP_MARKER or stripped.startswith("[chunk skipped"):
                 continue
-            kept.append(o.strip())
+            kept.append(stripped)
 
         if not kept:
             status_write(f"  ⚠️  {filename}: extraction returned no retained content — skipping this file")
