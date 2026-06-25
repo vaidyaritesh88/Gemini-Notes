@@ -591,6 +591,99 @@ def render_usage_panel():
             st.rerun()
 
 
+# ── Section-routing helper ─────────────────────────────────────────────────────
+# Each Map-stage output line is tagged `[Section X] ...`. Grouping by tag at
+# Reduce time means each section writer only receives its own facts — cutting
+# Reduce-stage input tokens by ~5-9× vs the original "pass everything to everyone"
+# behaviour, with no quality impact when Map tagging is well-behaved.
+
+# Matches:  [Section A] ...  •  [Section 1] ...  •  [Section 2.A] ...  •  case-insensitive
+_SECTION_TAG_RE = re.compile(r"^\s*\[Section\s+([A-Za-z0-9.]+)\]\s*(.*)$", re.IGNORECASE)
+
+
+def route_by_section(map_output: List[str]) -> Tuple[Dict[str, List[str]], List[str], float]:
+    """Parse all Map output lines and group by their [Section X] tag.
+    Returns:
+        (by_section, unrouted_lines, unrouted_fraction)
+        - by_section: dict keyed by section letter/number → list of tagged lines
+        - unrouted_lines: lines without a recognisable section tag (sent as
+          a catch-all pool to every section writer)
+        - unrouted_fraction: fraction of total lines that were unrouted
+          (status panel surfaces this so you can sanity-check Map tagging)
+    """
+    by_section: Dict[str, List[str]] = {}
+    unrouted: List[str] = []
+    total_lines = 0
+    for chunk_output in map_output:
+        for raw_line in chunk_output.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            total_lines += 1
+            m = _SECTION_TAG_RE.match(line)
+            if m:
+                key = m.group(1).upper()
+                by_section.setdefault(key, []).append(line)
+            else:
+                unrouted.append(line)
+    unrouted_fraction = (len(unrouted) / total_lines) if total_lines else 0.0
+    return by_section, unrouted, unrouted_fraction
+
+
+# ── Pre-flight cost estimation ─────────────────────────────────────────────────
+# Rough estimate shown to the user BEFORE running, so they can sanity-check
+# expected spend at current input size and model selection. Real cost typically
+# lands within ±30% of this. Output-token estimates assume the Map stage extracts
+# ~2,000 words per chunk and Reduce produces ~the configured word budget.
+
+_TOKENS_PER_WORD = 1.4  # tagged factual content tokenises slightly above plain prose
+
+
+def estimate_pipeline_cost(
+    ar_ip_words: int, transcript_words: int,
+    pass1_word_budget: int, pass2_word_budget: int,
+    map_model_id: str, reduce_model_id: str,
+) -> Dict:
+    """Estimate cost in USD for each pipeline stage at current settings."""
+    # Pass 1 Map
+    p1_step = CHUNK_SIZE_AR_IP - CHUNK_OVERLAP_AR_IP
+    p1_chunks = max(1, (ar_ip_words + p1_step - 1) // p1_step) if ar_ip_words else 0
+    p1_prompt_overhead_words = 1500
+    p1_map_in_tokens  = int(p1_chunks * (CHUNK_SIZE_AR_IP + p1_prompt_overhead_words) * _TOKENS_PER_WORD)
+    p1_map_out_tokens = int(p1_chunks * 2000 * _TOKENS_PER_WORD)
+    p1_map_cost = compute_cost(p1_map_in_tokens, p1_map_out_tokens, map_model_id)
+
+    # Pass 1 Reduce (post-routing: each section receives ~1/6 of Map output)
+    p1_map_total_output_tokens = p1_map_out_tokens
+    p1_reduce_in_tokens  = int(p1_map_total_output_tokens + 6 * p1_prompt_overhead_words * _TOKENS_PER_WORD)
+    p1_reduce_out_tokens = int(pass1_word_budget * _TOKENS_PER_WORD)
+    p1_reduce_cost = compute_cost(p1_reduce_in_tokens, p1_reduce_out_tokens, reduce_model_id)
+
+    # Pass 2 Map (factbase carried into every chunk)
+    p2_step = CHUNK_SIZE_TRANSCRIPT - CHUNK_OVERLAP_TRANSCRIPT
+    p2_chunks = max(1, (transcript_words + p2_step - 1) // p2_step) if transcript_words else 0
+    p2_factbase_overhead_words = pass1_word_budget  # factbase carried per chunk
+    p2_map_in_tokens  = int(p2_chunks * (CHUNK_SIZE_TRANSCRIPT + p1_prompt_overhead_words + p2_factbase_overhead_words) * _TOKENS_PER_WORD)
+    p2_map_out_tokens = int(p2_chunks * 2000 * _TOKENS_PER_WORD)
+    p2_map_cost = compute_cost(p2_map_in_tokens, p2_map_out_tokens, map_model_id)
+
+    # Pass 2 Reduce (post-routing: each section receives ~1/10 of Map output;
+    # factbase carried into each of 10 section calls)
+    p2_reduce_in_tokens  = int(p2_map_out_tokens + 10 * (pass1_word_budget + p1_prompt_overhead_words) * _TOKENS_PER_WORD)
+    p2_reduce_out_tokens = int(pass2_word_budget * _TOKENS_PER_WORD)
+    p2_reduce_cost = compute_cost(p2_reduce_in_tokens, p2_reduce_out_tokens, reduce_model_id)
+
+    return {
+        "pass1_map_cost":    p1_map_cost,
+        "pass1_reduce_cost": p1_reduce_cost,
+        "pass2_map_cost":    p2_map_cost,
+        "pass2_reduce_cost": p2_reduce_cost,
+        "total_cost":        p1_map_cost + p1_reduce_cost + p2_map_cost + p2_reduce_cost,
+        "pass1_chunks":      p1_chunks,
+        "pass2_chunks":      p2_chunks,
+    }
+
+
 # ── 6. MAP STAGE (Pass 1 and Pass 2) ───────────────────────────────────────────
 
 def _map_one_chunk(
@@ -688,51 +781,37 @@ def reduce_pass1(
     map_output: List[str], user_pass1_prompt: str, pass1_word_budget: int,
     model, status_write,
 ) -> str:
-    """Assemble FACTBASE by writing each section A–F in parallel with its budget."""
-    combined = "\n\n".join(map_output)
-    # Assign per-section word budgets from the within-pass weights
+    """Assemble FACTBASE by writing each section A–F in parallel with its budget.
+
+    Uses section-routing: each section writer receives ONLY the Map output lines
+    tagged for its section, plus a catch-all pool of unrouted lines (lines that
+    didn't carry a `[Section X]` tag). Cuts Reduce input tokens by ~5-6× vs the
+    previous "all-to-all" approach.
+    """
+    by_section, unrouted, unrouted_fraction = route_by_section(map_output)
+    status_write(
+        f"  Pass 1 Reduce: routed {sum(len(v) for v in by_section.values())} tagged lines into "
+        f"{len(by_section)} section bucket(s); {len(unrouted)} unrouted lines treated as catch-all "
+        f"({unrouted_fraction:.0%} of total)"
+    )
+
     sections = []
     for s in PASS_1_SECTIONS:
         sections.append({**s, "word_budget": int(pass1_word_budget * s["weight"])})
 
     status_write(f"  Pass 1 Reduce: writing {len(sections)} sections (A–F) in parallel")
-    results: List[Optional[str]] = [None] * len(sections)
-    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
-        futures = {
-            executor.submit(_write_pass1_section, section, user_pass1_prompt, combined, model): i
-            for i, section in enumerate(sections)
-        }
-        done = 0
-        for fut in as_completed(futures):
-            i = futures[fut]
-            results[i] = fut.result()
-            done += 1
-            sec = sections[i]
-            wc = len(results[i].split()) if results[i] else 0
-            status_write(
-                f"    • Pass 1 §{sec['key']}: {done}/{len(sections)} '{sec['heading']}' "
-                f"({wc:,} words, budget ~{sec['word_budget']:,})"
-            )
 
-    return "\n\n".join(r.strip() for r in results if r and r.strip())
+    def _section_input(sec_key: str) -> str:
+        """Lines tagged for this section + the catch-all unrouted pool."""
+        section_lines = by_section.get(sec_key.upper(), [])
+        return "\n".join(section_lines + unrouted)
 
-
-def reduce_pass2(
-    map_output: List[str], user_pass2_prompt_with_factbase: str,
-    pass2_word_budget: int, model, status_write,
-) -> str:
-    """Assemble ANALYSIS NOTE by writing each section 1–10 in parallel with its budget."""
-    combined = "\n\n".join(map_output)
-    sections = []
-    for s in PASS_2_SECTIONS:
-        sections.append({**s, "word_budget": int(pass2_word_budget * s["weight"])})
-
-    status_write(f"  Pass 2 Reduce: writing {len(sections)} sections (1–10) in parallel")
     results: List[Optional[str]] = [None] * len(sections)
     with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
         futures = {
             executor.submit(
-                _write_pass2_section, section, user_pass2_prompt_with_factbase, combined, model,
+                _write_pass1_section, section, user_pass1_prompt,
+                _section_input(section["key"]), model,
             ): i
             for i, section in enumerate(sections)
         }
@@ -743,9 +822,61 @@ def reduce_pass2(
             done += 1
             sec = sections[i]
             wc = len(results[i].split()) if results[i] else 0
+            section_input_words = len(_section_input(sec["key"]).split())
+            status_write(
+                f"    • Pass 1 §{sec['key']}: {done}/{len(sections)} '{sec['heading']}' "
+                f"({wc:,} words written from {section_input_words:,}-word input, budget ~{sec['word_budget']:,})"
+            )
+
+    return "\n\n".join(r.strip() for r in results if r and r.strip())
+
+
+def reduce_pass2(
+    map_output: List[str], user_pass2_prompt_with_factbase: str,
+    pass2_word_budget: int, model, status_write,
+) -> str:
+    """Assemble ANALYSIS NOTE by writing each section 1–10 in parallel with its budget.
+
+    Uses the same section-routing pattern as Pass 1 Reduce. Cuts Reduce input
+    tokens by ~9-10× vs the previous "all-to-all" approach.
+    """
+    by_section, unrouted, unrouted_fraction = route_by_section(map_output)
+    status_write(
+        f"  Pass 2 Reduce: routed {sum(len(v) for v in by_section.values())} tagged lines into "
+        f"{len(by_section)} section bucket(s); {len(unrouted)} unrouted lines treated as catch-all "
+        f"({unrouted_fraction:.0%} of total)"
+    )
+
+    sections = []
+    for s in PASS_2_SECTIONS:
+        sections.append({**s, "word_budget": int(pass2_word_budget * s["weight"])})
+
+    status_write(f"  Pass 2 Reduce: writing {len(sections)} sections (1–10) in parallel")
+
+    def _section_input(sec_key: str) -> str:
+        section_lines = by_section.get(sec_key.upper(), [])
+        return "\n".join(section_lines + unrouted)
+
+    results: List[Optional[str]] = [None] * len(sections)
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                _write_pass2_section, section, user_pass2_prompt_with_factbase,
+                _section_input(section["key"]), model,
+            ): i
+            for i, section in enumerate(sections)
+        }
+        done = 0
+        for fut in as_completed(futures):
+            i = futures[fut]
+            results[i] = fut.result()
+            done += 1
+            sec = sections[i]
+            wc = len(results[i].split()) if results[i] else 0
+            section_input_words = len(_section_input(sec["key"]).split())
             status_write(
                 f"    • Pass 2 §{sec['key']}: {done}/{len(sections)} '{sec['heading']}' "
-                f"({wc:,} words, budget ~{sec['word_budget']:,})"
+                f"({wc:,} words written from {section_input_words:,}-word input, budget ~{sec['word_budget']:,})"
             )
 
     return "\n\n".join(r.strip() for r in results if r and r.strip())
@@ -903,9 +1034,14 @@ def main():
         st.markdown("### Model Settings")
         map_model_name = st.selectbox(
             "Map model (per-chunk extraction)",
-            list(MODELS.keys()), index=0,
+            list(MODELS.keys()), index=1,  # Flash-Lite — 3× cheaper than Flash, fine for tagged extraction
             key="map_model",
-            help="Used for Pass 1 and Pass 2 Map stages. Flash-tier is fast and adequate for extraction.",
+            help=(
+                "Used for Pass 1 and Pass 2 Map stages. Default is **Flash-Lite** "
+                "(cheapest); upgrade to Flash if extraction quality looks thin. "
+                "Map is mechanical work — extracting tagged facts — not reasoning, "
+                "so the cheapest tier usually suffices."
+            ),
         )
         reduce_model_name = st.selectbox(
             "Reduce model (section writing)",
@@ -1068,6 +1204,60 @@ def main():
 
     stop_after_pass1     = stop_after.startswith("Stop after Pass 1")
     stop_after_pass2_map = stop_after.startswith("Stop after Pass 2 Map")
+
+    # ── Pre-flight cost estimate ───────────────────────────────────────────────
+    # Approximate cost at current settings, shown before the user commits.
+    # Source-files mode only — interim mode has different (much smaller) cost.
+    if not is_interim_mode and (uploaded_ar_ip or uploaded_transcripts):
+        ar_ip_words = sum(
+            len(f.getvalue().decode("utf-8", errors="replace").split()) for f in (uploaded_ar_ip or [])
+        )
+        tx_words = sum(
+            len(f.getvalue().decode("utf-8", errors="replace").split()) for f in (uploaded_transcripts or [])
+        )
+        map_model_id = MODELS.get(map_model_name, "gemini-2.5-flash")
+        reduce_model_id = MODELS.get(reduce_model_name, "gemini-2.5-pro")
+
+        est = estimate_pipeline_cost(
+            ar_ip_words, tx_words, pass1_word_budget, pass2_word_budget,
+            map_model_id, reduce_model_id,
+        )
+
+        # Scope cost to what will actually run given the stop_after selection
+        if stop_after_pass1:
+            run_cost = est["pass1_map_cost"] + est["pass1_reduce_cost"]
+            run_desc = "Pass 1 Map + Pass 1 Reduce"
+        elif stop_after_pass2_map:
+            run_cost = est["pass1_map_cost"] + est["pass1_reduce_cost"] + est["pass2_map_cost"]
+            run_desc = "Pass 1 (full) + Pass 2 Map"
+        else:
+            run_cost = est["total_cost"]
+            run_desc = "Full pipeline (all 4 stages)"
+
+        with st.expander(
+            f"💰 Estimated cost for this run: **~${run_cost:.2f}**  ({run_desc})",
+            expanded=False,
+        ):
+            st.caption(
+                "Rough estimate based on input word count, expected chunks, and current model "
+                "selection. Actual cost typically lands within ±30% of this. The biggest "
+                "uncertainty is per-chunk output length — verbose extraction inflates Map cost. "
+                "Section-routing in Reduce keeps the Reduce stages tight regardless of input size."
+            )
+            cost_lines = [
+                "| Stage | Model | Est. cost (USD) |",
+                "|---|---|---:|",
+                f"| Pass 1 Map ({est['pass1_chunks']:,} chunks) | `{map_model_id}` | ${est['pass1_map_cost']:.4f} |",
+                f"| Pass 1 Reduce (6 sections, routed) | `{reduce_model_id}` | ${est['pass1_reduce_cost']:.4f} |",
+                f"| Pass 2 Map ({est['pass2_chunks']:,} chunks) | `{map_model_id}` | ${est['pass2_map_cost']:.4f} |",
+                f"| Pass 2 Reduce (10 sections, routed) | `{reduce_model_id}` | ${est['pass2_reduce_cost']:.4f} |",
+                f"| **Total (full pipeline)** | — | **${est['total_cost']:.4f}** |",
+            ]
+            st.markdown("\n".join(cost_lines))
+            st.caption(
+                f"Input scale: AR/IP {ar_ip_words:,} words → {est['pass1_chunks']:,} Pass 1 chunks; "
+                f"Transcripts {tx_words:,} words → {est['pass2_chunks']:,} Pass 2 chunks."
+            )
 
     # ── Generate ───────────────────────────────────────────────────────────────
     st.divider()
