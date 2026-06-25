@@ -101,6 +101,117 @@ def compute_chunk_params(target_word_count: int) -> Tuple[int, int]:
     return 3000, 300
 
 
+# Default user prompt shipped in the UI text-area. The user can edit or replace it.
+# Designed for equity-research notes on ONE company across transcripts + presentations
+# + annual reports — but the tool itself is general; swap this out for other use cases.
+DEFAULT_USER_PROMPT = """ROLE
+You are an experienced equity analyst explaining ONE company to a sharp colleague who
+knows markets but not this company. Write the way you'd actually talk it through: in plain
+English, as a STORY, landing the things that matter and leaving out the noise. Your reader
+is an investment analyst, not an engineer — explain the business in business terms, never
+in procurement or product-brochure language.
+
+SOURCES
+All documents in this project: ~5 years of earnings-call transcripts, the last few
+investor presentations, and recent annual reports. Read them together. The transcripts —
+especially the analyst Q&A — are where management explains the WHY, so they carry the
+story. Annual reports are only for hard facts (segment splits, capacity, balance sheet);
+never reproduce their narrative or outlook prose, which is generic boilerplate.
+
+TWO ABSOLUTE RULES
+1. FACT before INTERPRETATION, always visually separate. State what management said or what
+   the numbers show as plain narrative. Then, where you add your own judgement, start a new
+   paragraph beginning "My read:" — the ONLY place your inference may appear. A reader must
+   be able to skip every "My read:" and still have a complete, accurate account of what the
+   company and management actually said.
+2. No outside data, no invented quotes. Not in the documents = say so. Quotes ≤25 words,
+   exact; otherwise paraphrase.
+
+READABILITY RULES — how to write so it's retained
+- Flowing paragraphs. No big tables, no bullet dumps, no reference codes, no
+  quarter-by-quarter logs.
+- FORMATTING FOR NAVIGATION: under each numbered section, break the prose with short bold
+  sub-headings (a few words each) that signal what the next paragraph(s) cover, so the
+  reader can scan the structure and find their place. Sub-headings label the content; they
+  don't replace the prose — write full paragraphs under each, not bullets. Use 2-5
+  sub-headings per section as the material needs; don't force them where a section is short.
+- Depth comes from EXPLAINING A FEW THINGS FULLY, not from listing many. For every claim
+  that matters, give the mechanism — the WHY behind it — in plain words. A reader should
+  finish each section understanding not just what happened but why.
+- When a point recurs across many quarters, say so plainly ("management has said for six
+  straight quarters that…") — repetition is the signal of what's load-bearing, and it's
+  what the reader will remember.
+- Round numbers, ranges, direction. You're telling a story, not reconciling a model.
+- Cut anything that only makes sense with heavy context you haven't given. If it matters,
+  give the context in half a sentence; if it doesn't, drop it.
+- The test for every paragraph: could the reader repeat this back to someone tomorrow? If
+  it's a pile of disconnected details, rewrite it as a point with a reason.
+
+WRITE THE NOTE IN THIS ORDER, AS FLOWING PROSE UNDER EACH HEADING (with bold sub-headings
+inside each section per the formatting rule above):
+
+1. WHAT THIS COMPANY DOES
+   In plain English: what does it sell, and to whom? Break revenue into its main buckets in
+   words (roughly what % each is), and for each, say who the customer is (state utilities /
+   private industrial capex / EPC contractors / OEMs / exports) and what that product does
+   for them. Where product type drives the economics — e.g. higher-voltage transformers are
+   harder to make, so fewer players and better margins — explain it that way, in cause-and-
+   effect business terms, not spec-sheet terms. Domestic vs export, plainly.
+   My read: where the genuinely attractive part of the mix sits, and why.
+
+2. THE STORY OF THE LAST 5 YEARS  (the heart of the note — give this the most space)
+   Tell it as a narrative, not a ledger. Cover, and connect, these threads:
+   - GROWTH: how sales and EBITDA grew, and crucially WHERE the growth came from — which
+     products/end-markets pulled it and WHY that demand appeared (a capex cycle, a policy
+     push, exports, a competitor stumbling, share gains). Don't just name the driver —
+     explain the mechanism behind it.
+   - MARGINS: what happened to margins and WHY — pricing power because the market was tight?
+     richer mix? or squeezed by a specific raw material? Say which, and whether management
+     framed the gains as durable or temporary.
+   - ORDER BOOK: how it grew and what it's signalling, since it leads sales — and whether
+     management said anything about the QUALITY (margin) of the book, not just its size.
+   - CAPACITY: how capacity expansion played out — did they add it, did it arrive in time,
+     did demand absorb it, or did they expand into a hot market late?
+   Weave these into one story, anchored on the few drivers that genuinely mattered, so the
+   reader can repeat the arc back. (Natural sub-headings here: the growth drivers, margins,
+   order book, capacity — use them as your bold sub-heads.)
+   My read: how much of this growth is structural versus a cyclical/peak moment, and which
+   parts I'd trust to persist.
+
+3. WHY THIS COMPANY WINS  (competitive advantage)
+   What actually lets them win business and hold margin — technology, approvals and track
+   record, customer relationships, scale, being one of few who can do the hard work?
+   Explain it as why a customer picks them over the next supplier.
+   My read: whether that edge is durable or just today's tightness flattering everyone.
+
+4. COMPETITION, AND HOW MANAGEMENT TALKS ABOUT IT
+   Who they compete with, and what management says when analysts push on new competition,
+   new capacity coming in, imports, or pricing pressure — do they sound relaxed or guarded,
+   and have they admitted any share loss or pricing slippage? Whether they engage the
+   question or deflect it is itself informative.
+   My read: whether the competitive threat is real and how honestly management is facing it.
+
+5. WHAT MANAGEMENT EXPECTS NEXT  (their words, kept clearly as their words)
+   Pull together what management has guided or signalled on demand and sales growth, order-
+   book outlook, and margins — and the REASONS they give for each, since the reasoning
+   matters more than the number. Include their stated plans on capacity and capital
+   allocation. Keep this strictly "management says," never blended with your own view.
+   My read: which expectations look well-supported versus optimistic, and what they're
+   quietly assuming.
+
+6. WHAT TO REMEMBER
+   Close with a short paragraph: the handful of things a busy investor should actually
+   carry away — the load-bearing points that recurred and matter. Plain sentences, no grab-
+   bag. This is the part the reader keeps.
+
+LENGTH & TONE
+Long enough to do justice to section 2, short enough to read in one sitting and summarise
+from memory. Depth on the things that matter, silence on the things that don't. If a
+section is thin in the sources, keep it short and say what's missing — never pad with
+generic industry talk.
+"""
+
+
 # ── 2. PROMPT TEMPLATES ────────────────────────────────────────────────────────
 
 # The user provides their own prompt at runtime. These templates WRAP the user's
@@ -1008,22 +1119,19 @@ def main():
     # ── User prompt ────────────────────────────────────────────────────────────
     st.markdown("### 3. Your prompt")
     st.caption(
-        "Describe the notes you want. This prompt is used in **both** stages — it tells the "
-        "map stage what to extract from each section, and it tells the reduce stage what the "
-        "final document should look like."
+        "A default prompt is shipped — an equity-analyst story-style company note. "
+        "Edit it or replace it entirely for other use cases. The prompt is used in **both** "
+        "stages: it tells the map stage what to extract from each section, and tells the "
+        "reduce stage what the final document should look like."
     )
-    user_prompt = st.text_area(
-        "Prompt",
-        height=200,
-        key="user_prompt",
-        placeholder=(
-            "e.g. 'Generate a research note tracking how management commentary on margins "
-            "has evolved across these earnings calls. For each quarter: stated guidance, actual "
-            "margin reported, and forward-looking commitments. Flag any inconsistencies between "
-            "quarters. Group by quarter chronologically.'"
-        ),
-        label_visibility="collapsed",
-    )
+    with st.expander("View / edit prompt (default shipped)", expanded=False):
+        user_prompt = st.text_area(
+            "Prompt",
+            value=DEFAULT_USER_PROMPT,
+            height=500,
+            key="user_prompt",
+            label_visibility="collapsed",
+        )
 
     # ── Length & chunk size ────────────────────────────────────────────────────
     st.markdown("### 4. Output length")
