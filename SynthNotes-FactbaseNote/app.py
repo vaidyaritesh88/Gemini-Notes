@@ -1039,9 +1039,44 @@ def main():
         f"Total target ~{total_words:,} words"
     )
 
+    # ── Pipeline scope (only in source-files mode) ─────────────────────────────
+    stop_after = "Full pipeline (FACTBASE + ANALYSIS NOTE merged)"
+    if not is_interim_mode:
+        next_section_num = str(int(next_section_num) + 1)
+        st.markdown(f"### {next_section_num}. Pipeline scope")
+        stop_after = st.radio(
+            "How far to run",
+            [
+                "Full pipeline (FACTBASE + ANALYSIS NOTE merged)",
+                "Stop after Pass 1 (FACTBASE only)",
+                "Stop after Pass 2 Map (FACTBASE + interim file, skip section writing)",
+            ],
+            index=0,
+            key="stop_after",
+            label_visibility="collapsed",
+            help=(
+                "**Full pipeline (default)** — Pass 1 Map → Pass 1 Reduce → Pass 2 Map → "
+                "Pass 2 Reduce → merge.\n\n"
+                "**Stop after Pass 1** — produces only the FACTBASE. Useful when you want to "
+                "review or hand-edit the factbase before spending compute on Pass 2.\n\n"
+                "**Stop after Pass 2 Map** — produces the FACTBASE and the Pass 2 Map output, "
+                "saving them as an interim .txt file you can resume from later. Useful for "
+                "auditing what was extracted from transcripts before committing to the 10 "
+                "section-writing calls. The cheapest way to produce an interim file for iteration."
+            ),
+        )
+
+    stop_after_pass1     = stop_after.startswith("Stop after Pass 1")
+    stop_after_pass2_map = stop_after.startswith("Stop after Pass 2 Map")
+
     # ── Generate ───────────────────────────────────────────────────────────────
     st.divider()
-    if st.button("Generate research note", type="primary", use_container_width=True):
+    button_label = "Generate research note"
+    if stop_after_pass1:
+        button_label = "Generate FACTBASE only"
+    elif stop_after_pass2_map:
+        button_label = "Generate FACTBASE + Pass 2 Map (save interim)"
+    if st.button(button_label, type="primary", use_container_width=True):
         # Validation
         if is_interim_mode:
             if not interim_uploaded:
@@ -1117,6 +1152,13 @@ def main():
         reduce_model = get_model(reduce_model_name)
         st.session_state["usage_log"] = []  # fresh per run
 
+        ar_ip_names      = [f[0] for f in ar_ip_files]
+        transcript_names = [f[0] for f in transcript_files]
+
+        # Track which stages actually ran so the output renderer can branch.
+        # Set to one of: "pass1", "pass2_map", "full"
+        stopped_after = "full"
+
         with st.status("Processing…", expanded=True) as status:
             try:
                 # ── STAGE A: PASS 1 (only in source-files mode) ──────────────
@@ -1144,67 +1186,105 @@ def main():
                         f"  ✓ FACTBASE complete — **{len(factbase.split()):,} words** "
                         f"({len(factbase.split()) / pass1_word_budget * 100:.0f}% of {pass1_word_budget:,} budget)"
                     )
-
-                    # ── STAGE B (part 1): PASS 2 MAP (factbase as context) ──
-                    st.write(f"**STAGE B — PASS 2 (ANALYSIS NOTE)** — {len(transcript_files)} transcript file(s)")
-                    pass2_prompt_with_factbase = inject_factbase(pass2_prompt, factbase)
-                    pass2_map_output = map_pass(
-                        transcript_files, pass2_prompt_with_factbase,
-                        CHUNK_SIZE_TRANSCRIPT, CHUNK_OVERLAP_TRANSCRIPT,
-                        map_model, "Pass 2 Map", st.write,
-                    )
-                    if not pass2_map_output:
-                        raise ValueError("Pass 2 Map produced no notes.")
-                    st.write(
-                        f"  ✓ Pass 2 Map complete — {len(pass2_map_output)} chunk extracts, "
-                        f"~{sum(len(n.split()) for n in pass2_map_output):,} words"
-                    )
                 else:
                     st.write(
-                        f"⏩ Skipping Pass 1 + Pass 2 Map — loaded from interim "
-                        f"(factbase: {len(factbase.split()):,} words; "
-                        f"Pass 2 Map: {len(pass2_map_output)} extracts)"
+                        f"⏩ Pass 1 skipped — factbase loaded from interim "
+                        f"({len(factbase.split()):,} words)"
                     )
 
-                # ── Save interim now (before Pass 2 Reduce) so user has it ─
-                ar_ip_names = [f[0] for f in ar_ip_files]
-                transcript_names = [f[0] for f in transcript_files]
-                st.session_state["interim_notes_text"] = serialize_interim(
-                    factbase, pass2_map_output, ar_ip_names, transcript_names,
-                )
+                # ── EARLY EXIT 1: stop after Pass 1 ─────────────────────────
+                if stop_after_pass1:
+                    stopped_after = "pass1"
+                    # Persist results — no interim file (Pass 2 Map didn't run)
+                    st.session_state["final_document"]       = "# FACT-BASE\n\n" + factbase.strip()
+                    st.session_state["factbase"]             = factbase
+                    st.session_state["analysis_note"]        = ""
+                    st.session_state["interim_notes_text"]   = ""
+                    st.session_state["ar_ip_filenames"]      = ar_ip_names
+                    st.session_state["transcript_filenames"] = []
+                    st.session_state["total_target"]         = pass1_word_budget
+                    st.session_state["stopped_after"]        = stopped_after
+                    status.update(label="Done — stopped after Pass 1 (FACTBASE only)", state="complete")
+                    st.write(f"**✓ FACTBASE: {len(factbase.split()):,} words.** Pass 2 was skipped.")
+                else:
+                    # ── STAGE B (part 1): PASS 2 MAP (factbase as context) ──
+                    if not is_interim_mode:
+                        st.write(f"**STAGE B — PASS 2 (ANALYSIS NOTE)** — {len(transcript_files)} transcript file(s)")
+                        pass2_prompt_with_factbase = inject_factbase(pass2_prompt, factbase)
+                        pass2_map_output = map_pass(
+                            transcript_files, pass2_prompt_with_factbase,
+                            CHUNK_SIZE_TRANSCRIPT, CHUNK_OVERLAP_TRANSCRIPT,
+                            map_model, "Pass 2 Map", st.write,
+                        )
+                        if not pass2_map_output:
+                            raise ValueError("Pass 2 Map produced no notes.")
+                        st.write(
+                            f"  ✓ Pass 2 Map complete — {len(pass2_map_output)} chunk extracts, "
+                            f"~{sum(len(n.split()) for n in pass2_map_output):,} words"
+                        )
+                    else:
+                        st.write(
+                            f"⏩ Pass 2 Map skipped — {len(pass2_map_output)} extracts loaded from interim"
+                        )
 
-                # ── STAGE B (part 2): PASS 2 REDUCE ─────────────────────────
-                pass2_prompt_with_factbase = inject_factbase(pass2_prompt, factbase)
-                analysis_note = reduce_pass2(
-                    pass2_map_output, pass2_prompt_with_factbase, pass2_word_budget,
-                    reduce_model, st.write,
-                )
-                if not analysis_note.strip():
-                    raise ValueError("Pass 2 Reduce produced empty analysis note.")
-                st.write(
-                    f"  ✓ ANALYSIS NOTE complete — **{len(analysis_note.split()):,} words** "
-                    f"({len(analysis_note.split()) / pass2_word_budget * 100:.0f}% of {pass2_word_budget:,} budget)"
-                )
+                    # Save interim NOW (before Pass 2 Reduce) so user has it
+                    st.session_state["interim_notes_text"] = serialize_interim(
+                        factbase, pass2_map_output, ar_ip_names, transcript_names,
+                    )
 
-                # ── STAGE C: MERGE (mechanical) ─────────────────────────────
-                final_doc = (
-                    "# FACT-BASE\n\n"
-                    + factbase.strip()
-                    + "\n\n---\n\n"
-                    + "# ANALYSIS NOTE\n\n"
-                    + analysis_note.strip()
-                )
-                st.session_state["final_document"]      = final_doc
-                st.session_state["factbase"]            = factbase
-                st.session_state["analysis_note"]       = analysis_note
-                st.session_state["ar_ip_filenames"]     = ar_ip_names
-                st.session_state["transcript_filenames"] = transcript_names
-                st.session_state["total_target"]        = total_words
+                    # ── EARLY EXIT 2: stop after Pass 2 Map ─────────────────
+                    if stop_after_pass2_map:
+                        stopped_after = "pass2_map"
+                        st.session_state["final_document"]       = "# FACT-BASE\n\n" + factbase.strip()
+                        st.session_state["factbase"]             = factbase
+                        st.session_state["analysis_note"]        = ""
+                        st.session_state["ar_ip_filenames"]      = ar_ip_names
+                        st.session_state["transcript_filenames"] = transcript_names
+                        st.session_state["total_target"]         = pass1_word_budget
+                        st.session_state["stopped_after"]        = stopped_after
+                        status.update(
+                            label="Done — stopped after Pass 2 Map (interim ready)",
+                            state="complete",
+                        )
+                        st.write(
+                            f"**✓ FACTBASE: {len(factbase.split()):,} words. "
+                            f"Pass 2 Map: {len(pass2_map_output)} extracts.** "
+                            "Interim file ready to download below."
+                        )
+                    else:
+                        # ── STAGE B (part 2): PASS 2 REDUCE ─────────────────
+                        pass2_prompt_with_factbase = inject_factbase(pass2_prompt, factbase)
+                        analysis_note = reduce_pass2(
+                            pass2_map_output, pass2_prompt_with_factbase, pass2_word_budget,
+                            reduce_model, st.write,
+                        )
+                        if not analysis_note.strip():
+                            raise ValueError("Pass 2 Reduce produced empty analysis note.")
+                        st.write(
+                            f"  ✓ ANALYSIS NOTE complete — **{len(analysis_note.split()):,} words** "
+                            f"({len(analysis_note.split()) / pass2_word_budget * 100:.0f}% of {pass2_word_budget:,} budget)"
+                        )
 
-                actual = len(final_doc.split())
-                pct = actual / total_words * 100
-                status.update(label="Done!", state="complete")
-                st.write(f"**✓ Final document: {actual:,} words ({pct:.0f}% of {total_words:,}-word target)**")
+                        # ── STAGE C: MERGE (mechanical) ─────────────────────
+                        final_doc = (
+                            "# FACT-BASE\n\n"
+                            + factbase.strip()
+                            + "\n\n---\n\n"
+                            + "# ANALYSIS NOTE\n\n"
+                            + analysis_note.strip()
+                        )
+                        st.session_state["final_document"]       = final_doc
+                        st.session_state["factbase"]             = factbase
+                        st.session_state["analysis_note"]        = analysis_note
+                        st.session_state["ar_ip_filenames"]      = ar_ip_names
+                        st.session_state["transcript_filenames"] = transcript_names
+                        st.session_state["total_target"]         = total_words
+                        st.session_state["stopped_after"]        = "full"
+
+                        actual = len(final_doc.split())
+                        pct = actual / total_words * 100
+                        status.update(label="Done!", state="complete")
+                        st.write(f"**✓ Final document: {actual:,} words ({pct:.0f}% of {total_words:,}-word target)**")
 
             except Exception as e:
                 status.update(label="Failed", state="error")
@@ -1213,23 +1293,43 @@ def main():
     # ── Output ─────────────────────────────────────────────────────────────────
     if "final_document" in st.session_state:
         st.divider()
-        doc           = st.session_state["final_document"]
-        interim_text  = st.session_state.get("interim_notes_text", "")
-        ar_ip_names   = st.session_state.get("ar_ip_filenames", [])
-        tx_names      = st.session_state.get("transcript_filenames", [])
-        total_target  = st.session_state.get("total_target", 0)
+        doc            = st.session_state["final_document"]
+        interim_text   = st.session_state.get("interim_notes_text", "")
+        ar_ip_names    = st.session_state.get("ar_ip_filenames", [])
+        tx_names       = st.session_state.get("transcript_filenames", [])
+        total_target   = st.session_state.get("total_target", 0)
+        stopped_after  = st.session_state.get("stopped_after", "full")
+
+        # Adapt the title + caption + filenames to what was actually generated
+        if stopped_after == "pass1":
+            doc_title       = "FACT-BASE (Pass 1 only)"
+            doc_subtitle    = "Pass 2 was skipped. The interim file is not available because Pass 2 Map did not run."
+            md_filename     = "synthnotes_factbasenote_factbase.md"
+            pdf_filename    = "synthnotes_factbasenote_factbase.pdf"
+        elif stopped_after == "pass2_map":
+            doc_title       = "FACT-BASE (Pass 2 Map saved to interim — section writing skipped)"
+            doc_subtitle    = "Pass 2 section writing was skipped. The interim file below contains the factbase + Pass 2 Map output — load it via *Saved interim notes* mode to run only Pass 2 Reduce."
+            md_filename     = "synthnotes_factbasenote_factbase.md"
+            pdf_filename    = "synthnotes_factbasenote_factbase.pdf"
+        else:
+            doc_title       = "Research Note"
+            doc_subtitle    = None
+            md_filename     = "synthnotes_factbasenote.md"
+            pdf_filename    = "synthnotes_factbasenote.pdf"
 
         col_title, col_copy, col_md, col_pdf = st.columns([2, 1, 1, 1])
         with col_title:
             actual = len(doc.split())
-            st.subheader(f"Research Note  ({actual:,} words)")
+            st.subheader(f"{doc_title}  ({actual:,} words)")
+            if doc_subtitle:
+                st.caption(doc_subtitle)
         with col_copy:
             copy_button(doc, "Copy")
         with col_md:
             st.download_button(
                 "Download .md",
                 data=doc,
-                file_name="synthnotes_factbasenote.md",
+                file_name=md_filename,
                 mime="text/markdown",
                 use_container_width=True,
                 key="dl_md",
@@ -1240,7 +1340,7 @@ def main():
                 st.download_button(
                     "Download .pdf",
                     data=pdf_bytes,
-                    file_name="synthnotes_factbasenote.pdf",
+                    file_name=pdf_filename,
                     mime="application/pdf",
                     use_container_width=True,
                     key="dl_pdf",
