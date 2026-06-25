@@ -1095,11 +1095,14 @@ def main():
         )
         reduce_model_name = st.selectbox(
             "Synthesis model (Reduce stage)",
-            list(MODELS.keys()), index=2,
+            list(MODELS.keys()), index=3,  # Gemini 3.0 Flash — Flash-tier pricing, capable reasoning
             key="reduce_model",
             help=(
-                "Used to combine all per-chunk notes into the final document and infer "
-                "chronology. Higher-quality model recommended (2.5 Pro is the default)."
+                "Used for outline generation and per-section writing during synthesis. "
+                "Default is **Gemini 3.0 Flash** (`gemini-3-flash-preview`) — Flash-tier "
+                "pricing ($0.50 / $3.00 per 1M tokens) with strong reasoning. ~3× cheaper "
+                "than 2.5 Pro. Switch to 2.5 Pro if sections come out thin or the outline "
+                "feels shallow. Note: preview model — could be deprecated by Google with notice."
             ),
         )
 

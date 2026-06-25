@@ -310,6 +310,111 @@ Never let interpretation leak into a FACTS block. Never pad with generic industr
 """
 
 
+# Prose-style alternative — used when the user picks "Readable prose" output mode.
+# Ports MultiDoc's flowing-paragraph + bold-sub-heading discipline into FactbaseNote's
+# 10-section structure. Three sections stay tabular because their natural shape is
+# tabular (§6 chronological log, §8 contradiction list, §10 single pipe-delimited line).
+DEFAULT_PASS_2_PROMPT_PROSE = """ROLE
+You are an equity analyst writing a REASONING note on ONE company. Your primary source
+is the earnings-call transcripts in this project — especially the analyst Q&A. You also
+have a FACT-BASE built from annual reports and presentations; use it as reference and
+check transcript claims against it.
+
+[PASTE company_factbase.md HERE]
+
+SOURCE DISCIPLINE
+- Transcripts are PRIMARY for all WHY questions. Tag transcript claims [Q_FY__].
+- FACT-BASE above is REFERENCE. Cite IDs (e.g. F-SEG-02) when you use or test one.
+- No outside data, no invented quotes. Not in transcripts and not in the factbase = "not in sources".
+- Quotes ≤25 words, exact, attributed. Prefer paraphrase.
+
+TWO ABSOLUTE RULES
+1. FACT before INTERPRETATION. State what management said or what the documents show as
+   PLAIN PROSE, with source tags inline (e.g. [Q_FY24]). Then, where you add your own
+   judgement, start a NEW PARAGRAPH beginning literally "My read:" — the ONLY place your
+   inference may appear. A reader must be able to skip every "My read:" paragraph and
+   still have a complete factual account of what management said.
+2. Never invent. Not in sources = say so.
+
+READABILITY RULES — how to write so it's retained
+- Flowing paragraphs. NO big tables, NO bullet dumps, NO reference-code lists — EXCEPT
+  in the three inherently-tabular sections noted below (§6, §8, §10).
+- FORMATTING FOR NAVIGATION: under each numbered section, break the prose with 2–4 short
+  bold sub-headings (a few words each) that signal what the next paragraph covers.
+  Sub-headings label the content; they don't replace prose — write full paragraphs under
+  each sub-heading.
+- Depth comes from EXPLAINING A FEW THINGS FULLY, not from listing many. For every claim
+  that matters, give the mechanism — the WHY — in plain words.
+- When a point recurs across many quarters, say so plainly ("management has said for six
+  straight quarters that…"). Repetition is the signal of what's load-bearing.
+- Round numbers, ranges, direction. You're telling a story, not reconciling a model.
+- The test for every paragraph: could the reader repeat it back to a colleague tomorrow?
+
+OUTPUT — these 10 sections, in order:
+
+1. GROWTH DRIVERS, YEAR BY YEAR  (FLOWING PROSE with bold sub-heads)
+   Tell the year-by-year growth story as 2–3 paragraphs. For each year, name what
+   management ATTRIBUTED growth to, the segment/geography they cited, any one-off orders.
+   My read: structural vs cyclical split; which attributions look durable.
+
+2. BIDDING DISCIPLINE & ORDER STRATEGY  (PROSE)
+   What management said about order selection, walking away, margin thresholds, order-book
+   inflow and execution period. 2–3 paragraphs with sub-heads.
+   My read: genuine discipline vs fill-the-factory; how it shifted with the cycle.
+
+3. COMPETITIVE INTENSITY & MOAT  (PROSE)
+   What management said about their OWN advantage; separately, what they said about
+   competition — new entrants, peer capacity, imports, pricing — and whether they engaged
+   or deflected. 2–3 paragraphs.
+   My read: durable moat vs cyclical tightness; competition genuinely rising.
+
+4. MARGIN DRIVERS  (PROSE)
+   The reasons management gave for margin moves — pricing, mix, leverage, commodities,
+   employee cost, forex, pass-through. 2–3 paragraphs separating tailwinds from headwinds.
+   My read: shortage-driven vs structural; sustainability vs F-FIN margin trajectory.
+
+5. GROWTH CONSTRAINTS & MANPOWER  (PROSE, weight last 4 quarters)
+   Every constraint management actually named (capacity, specific inputs, working capital,
+   customer/RoW delay, manpower); remedy and timeline they gave. 2–3 paragraphs.
+   My read: which constraint is genuinely binding; whether the remedies are credible.
+
+6. ANALYST QUESTION LOG — LAST ~8 QUARTERS  (CHRONOLOGICAL TABLE — keep tabular)
+   This section IS a table. Quarter [Q_FY__] | analyst question theme | management response
+   (paraphrase; ≤25-word exact quote only where wording matters) | Direct/Partial/Evasive.
+   My read (one paragraph at end): which concerns recur, which got dodged, how the line of
+   questioning shifted across the 8 quarters.
+
+7. MANAGEMENT QUALITY & CYCLICALITY AWARENESS  (PROSE)
+   How they talked about the down-cycle in good quarters; capacity-expansion actions and
+   their order-backing; whether past forward statements delivered. 2–3 paragraphs. End the
+   prose with a "Cyclicality-awareness rating: X/5" sentence with the two strongest
+   supporting facts.
+   My read: capital-allocation read referencing F-BS / F-GOV.
+
+8. DISSONANCE SUMMARY  (LIST — keep as list of contradictions)
+   One contradiction per item: transcript claim [Q_FY__] vs factbase F-xx, stated plainly
+   with both sides.
+   My read (one paragraph at end): ranked by importance to the investment view.
+
+9. OPEN QUESTIONS FOR THE FORWARD PASS  (PLAIN LIST)
+   3–6 specific things the backward sources don't resolve. Plain list, one per line.
+   No INTERPRETATION block.
+
+10. SCORECARD ROW  (SINGLE PIPE-DELIMITED LINE)
+    One line, exactly: Company | segments (top 3) | end-customer skew | domestic/export %
+    | 5y rev CAGR | 5y EBITDA CAGR | margin trend | primary growth driver (≤4 words) |
+    structural vs cyclical | moat type (≤4 words) | competition rising? (Y/N) | binding
+    constraint (≤4 words) | bidding discipline (H/M/L) | guidance reliability (H/M/L) |
+    cyclicality awareness (1-5) | top dissonance flag (≤6 words). No INTERPRETATION block.
+
+STYLE
+Prose sections: 2–3 paragraphs each, 2–4 bold sub-heads, "My read:" as a labeled paragraph.
+Tabular sections (6, 8): the natural shape. Sections 9, 10: list / single line.
+Tags inline within sentences. Thin sources → short + say what's missing.
+Never pad with generic industry talk.
+"""
+
+
 # ── 4. PROMPT TEMPLATES (wrap user prompts for Map / Section-write stages) ─────
 
 MAP_WRAPPER_TEMPLATE = """{user_pass_prompt}
@@ -407,6 +512,56 @@ Sections 9 and 10 are exceptions:
 9. Stay near **{section_word_budget} words**. If your draft is much shorter than budget, pull more from the per-chunk extracts.
 10. Cite [Q_FY__] tags on all transcript claims; cite F-xx tags when referencing factbase items.
 11. No preamble. No conclusion. Just the section.
+
+Write your section now."""
+
+
+# Prose-style per-section wrapper — used when output mode is "Readable prose"
+PASS_2_SECTION_PROMPT_PROSE = """You are writing ONE SECTION of a structured ANALYSIS NOTE assembled from per-quarter transcript notes. Write in **flowing prose** with bold sub-headings, not tables or bullet lists.
+
+### USER'S FULL PASS 2 PROMPT (with FACT-BASE injected — has SOURCE DISCIPLINE, READABILITY RULES, FORMAT, STYLE)
+{user_pass2_prompt_with_factbase}
+
+### YOUR ASSIGNED SECTION
+- **Heading**: {section_heading}
+- **Scope**: {section_scope}
+- **Target word count**: approximately **{section_word_budget} words**
+
+### CRITICAL — DO NOT COVER OTHER SECTIONS' MATERIAL
+Other sections (1 through 10) are being written by separate parallel calls. Stay strictly within YOUR assigned section.
+
+### FORMAT FOR THIS SECTION
+Three sections are inherently tabular and must keep that shape:
+- **§6 (Analyst Question Log)** — chronological table; columns: Quarter [Q_FY__] | question theme | response paraphrase | Direct/Partial/Evasive. End with one "My read:" paragraph.
+- **§8 (Dissonance Summary)** — list of contradictions, one per line; each line: transcript claim [Q_FY__] vs factbase F-xx. End with one "My read:" paragraph ranking them.
+- **§10 (Scorecard Row)** — a SINGLE pipe-delimited line, no headings, no "My read:" block.
+
+For all OTHER sections (1, 2, 3, 4, 5, 7, 9), write **FLOWING PROSE**:
+- **2–3 paragraphs** of plain prose under the section heading.
+- **2–4 bold sub-headings** within the section to give the reader scannable structure. Sub-headings label what each paragraph covers — write full paragraphs underneath, not bullets.
+- Source tags inline within sentences ([Q_FY24], F-SEG-02) — not at the end of bullet lines.
+- For §1–§5 and §7: **End with a separate paragraph beginning literally "My read:"** — the only place your inference appears.
+- §9 (Open Questions): plain list of 3–6 items; no "My read:" block.
+
+### GOLDEN RULE — FACT BEFORE INTERPRETATION
+A reader must be able to skip every "My read:" paragraph and still have a complete factual account. Don't smuggle inference into the FACTS prose.
+
+### READABILITY DISCIPLINE
+- Round numbers, ranges, direction. You're telling a story, not reconciling a model.
+- When a point recurs across many quarters, say so plainly ("management has said for six straight quarters that…"). Repetition is the signal of what matters.
+- The test: could the reader repeat each paragraph back to a colleague tomorrow?
+
+### EXTRACTED PER-CHUNK ANALYSIS (tagged by section)
+{combined_map_output}
+
+### INSTRUCTIONS
+1. Read all the extracted material above.
+2. Select content tagged `[Section {section_key}]` (or which clearly belongs to your section).
+3. Apply the format for THIS section per the rules above.
+4. Begin with the heading exactly: `{section_heading}`
+5. Cite [Q_FY__] tags on transcript claims; cite F-xx tags when referencing factbase.
+6. Stay near **{section_word_budget} words**.
+7. No preamble. No conclusion. Just the section.
 
 Write your section now."""
 
@@ -763,9 +918,15 @@ def _write_pass1_section(
 def _write_pass2_section(
     section: Dict, user_pass2_prompt_with_factbase: str,
     combined_map_output: str, model,
+    use_prose_style: bool = False,
 ) -> str:
-    """Write ONE section (1–10) of the analysis note, with assigned word budget."""
-    prompt = PASS_2_SECTION_PROMPT.format(
+    """Write ONE section (1–10) of the analysis note, with assigned word budget.
+    `use_prose_style` selects the section-write wrapper template:
+      False (default) → PASS_2_SECTION_PROMPT  (tables / tagged bullets / FACTS block)
+      True            → PASS_2_SECTION_PROMPT_PROSE  (flowing prose with bold sub-headings)
+    """
+    template = PASS_2_SECTION_PROMPT_PROSE if use_prose_style else PASS_2_SECTION_PROMPT
+    prompt = template.format(
         user_pass2_prompt_with_factbase=user_pass2_prompt_with_factbase.strip(),
         section_heading=section["heading"],
         section_scope=section["scope"],
@@ -834,11 +995,16 @@ def reduce_pass1(
 def reduce_pass2(
     map_output: List[str], user_pass2_prompt_with_factbase: str,
     pass2_word_budget: int, model, status_write,
+    use_prose_style: bool = False,
 ) -> str:
     """Assemble ANALYSIS NOTE by writing each section 1–10 in parallel with its budget.
 
     Uses the same section-routing pattern as Pass 1 Reduce. Cuts Reduce input
     tokens by ~9-10× vs the previous "all-to-all" approach.
+
+    `use_prose_style=True` switches the per-section wrapper to the prose-style
+    template, producing flowing-paragraphs-with-bold-sub-headings output (like
+    MultiDoc) instead of the default tables/bullets/FACTS-block format.
     """
     by_section, unrouted, unrouted_fraction = route_by_section(map_output)
     status_write(
@@ -862,7 +1028,7 @@ def reduce_pass2(
         futures = {
             executor.submit(
                 _write_pass2_section, section, user_pass2_prompt_with_factbase,
-                _section_input(section["key"]), model,
+                _section_input(section["key"]), model, use_prose_style,
             ): i
             for i, section in enumerate(sections)
         }
@@ -1045,9 +1211,15 @@ def main():
         )
         reduce_model_name = st.selectbox(
             "Reduce model (section writing)",
-            list(MODELS.keys()), index=2,
+            list(MODELS.keys()), index=3,  # Gemini 3.0 Flash — Flash-tier pricing, capable reasoning
             key="reduce_model",
-            help="Used to write each section of FACTBASE and ANALYSIS NOTE. Higher quality recommended (Pro by default).",
+            help=(
+                "Used to write each section of FACTBASE and ANALYSIS NOTE. Default is "
+                "**Gemini 3.0 Flash** (`gemini-3-flash-preview`) — Flash-tier pricing "
+                "($0.50 / $3.00 per 1M tokens) with strong reasoning. ~3× cheaper than 2.5 Pro. "
+                "Switch to 2.5 Pro if section writing comes out thin. Note: this is a preview "
+                "model — could be deprecated by Google with notice."
+            ),
         )
 
     # ── Mode toggle ────────────────────────────────────────────────────────────
@@ -1123,20 +1295,60 @@ def main():
     if is_interim_mode:
         st.caption("*(Pass 1 prompt not used in interim mode — Pass 1 is skipped.)*")
 
-    # ── Pass 2 prompt (editable) ───────────────────────────────────────────────
+    # ── Output mode ────────────────────────────────────────────────────────────
+    # Bundles two related choices: (a) which Pass 2 prompt style drives section
+    # writing, and (b) whether the factbase appears in the final deliverable.
+    next_section_num = str(int(next_section_num) + 1)
+    st.markdown(f"### {next_section_num}. Output mode")
+    output_mode = st.radio(
+        "Output style",
+        [
+            "Original — FACT-BASE + ANALYSIS NOTE (tables, tagged bullets, FACTS/INTERPRETATION blocks)",
+            "Readable prose — ANALYSIS NOTE only (flowing prose with bold sub-headings, like MultiDoc)",
+        ],
+        index=0,
+        key="output_mode",
+        label_visibility="collapsed",
+        help=(
+            "**Original (default)** — final document is `FACT-BASE` + `ANALYSIS NOTE`, "
+            "written in the original FactbaseNote style: tables, tagged bullet lists, and "
+            "explicit FACTS / INTERPRETATION blocks. Maximum auditability.\n\n"
+            "**Readable prose** — final document is just the ANALYSIS NOTE, written as "
+            "flowing prose with bold sub-headings (sections 1–5, 7, 9 become prose; §6 Q "
+            "Log, §8 Dissonance, §10 Scorecard stay tabular as natural shape). The factbase "
+            "is still generated and used as Pass 2 context, and still saved in the interim "
+            "file — it just doesn't appear in the final deliverable. Easier to read in one "
+            "sitting; better for sharing."
+        ),
+    )
+    use_prose_style = output_mode.startswith("Readable prose")
+
+    # ── Pass 2 prompt (editable, default depends on output mode) ───────────────
     next_section_num = str(int(next_section_num) + 1)
     st.markdown(f"### {next_section_num}. Pass 2 prompt — ANALYSIS NOTE reasoning (editable)")
-    with st.expander("View / edit Pass 2 prompt (default shipped)", expanded=False):
+    # Each output mode gets its own session-state slot so user edits to the two
+    # prompt variants don't clobber each other when switching modes.
+    if use_prose_style:
+        pass2_default = DEFAULT_PASS_2_PROMPT_PROSE
+        pass2_key     = "pass2_prompt_prose"
+        pass2_label   = "View / edit Pass 2 prompt — PROSE style (default shipped)"
+    else:
+        pass2_default = DEFAULT_PASS_2_PROMPT
+        pass2_key     = "pass2_prompt_original"
+        pass2_label   = "View / edit Pass 2 prompt — ORIGINAL style (default shipped)"
+    with st.expander(pass2_label, expanded=False):
         pass2_prompt = st.text_area(
             "Pass 2 prompt",
-            value=DEFAULT_PASS_2_PROMPT,
+            value=pass2_default,
             height=400,
-            key="pass2_prompt",
+            key=pass2_key,
             label_visibility="collapsed",
             help=(
                 "The full Pass 2 prompt used for transcript processing. The placeholder "
                 "`[PASTE company_factbase.md HERE]` will be auto-replaced with the factbase. "
-                "If you remove it, the factbase is prepended as a labelled block."
+                "If you remove it, the factbase is prepended as a labelled block. "
+                "Edits to the Original prompt and the Prose prompt are kept separately — "
+                "switching modes doesn't clobber your edits."
             ),
         )
 
@@ -1204,6 +1416,18 @@ def main():
 
     stop_after_pass1     = stop_after.startswith("Stop after Pass 1")
     stop_after_pass2_map = stop_after.startswith("Stop after Pass 2 Map")
+
+    # ── Output composition derived from output_mode ─────────────────────────
+    # In "Original" mode the factbase appears in the final document; in
+    # "Readable prose" mode the factbase is hidden (still generated, still in
+    # interim — just not in the final deliverable). Early-stop modes (Pass 1
+    # only, Pass 2 Map only) ALWAYS produce the factbase as deliverable so
+    # this flag is forced on in those cases.
+    will_run_pass2_reduce = is_interim_mode or (not stop_after_pass1 and not stop_after_pass2_map)
+    if will_run_pass2_reduce:
+        include_factbase_in_final = not use_prose_style
+    else:
+        include_factbase_in_final = True  # factbase IS the deliverable in early-stop modes
 
     # ── Pre-flight cost estimate ───────────────────────────────────────────────
     # Approximate cost at current settings, shown before the user commits.
@@ -1447,6 +1671,7 @@ def main():
                         analysis_note = reduce_pass2(
                             pass2_map_output, pass2_prompt_with_factbase, pass2_word_budget,
                             reduce_model, st.write,
+                            use_prose_style=use_prose_style,
                         )
                         if not analysis_note.strip():
                             raise ValueError("Pass 2 Reduce produced empty analysis note.")
@@ -1456,13 +1681,17 @@ def main():
                         )
 
                         # ── STAGE C: MERGE (mechanical) ─────────────────────
-                        final_doc = (
-                            "# FACT-BASE\n\n"
-                            + factbase.strip()
-                            + "\n\n---\n\n"
-                            + "# ANALYSIS NOTE\n\n"
-                            + analysis_note.strip()
-                        )
+                        if include_factbase_in_final:
+                            final_doc = (
+                                "# FACT-BASE\n\n"
+                                + factbase.strip()
+                                + "\n\n---\n\n"
+                                + "# ANALYSIS NOTE\n\n"
+                                + analysis_note.strip()
+                            )
+                        else:
+                            # Just the analysis note; factbase available in interim file
+                            final_doc = analysis_note.strip()
                         st.session_state["final_document"]       = final_doc
                         st.session_state["factbase"]             = factbase
                         st.session_state["analysis_note"]        = analysis_note
