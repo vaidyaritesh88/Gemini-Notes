@@ -1899,9 +1899,11 @@ def main():
                 st.session_state["target_words"]     = word_count
 
                 # ── Stage auto-download — fires once on the next render ─────
-                # Full pipeline: auto-download the final document as .md + .txt,
-                # plus the combined extract as .txt (in case session is lost
-                # before user manually downloads).
+                # Full pipeline auto-downloads everything that matters in case
+                # the session dies later:
+                #   - final document in two formats (.md, .txt)
+                #   - combined extract (.txt) — portable input for other tools
+                #   - interim notes (.txt) — Map-stage cache for resume mode
                 _pending: List[Tuple[str, str, str]] = [
                     (filename_for(company_name, "synthnotes", "md"),  final_doc, "text/markdown"),
                     (filename_for(company_name, "synthnotes", "txt"), final_doc, "text/plain"),
@@ -1910,6 +1912,11 @@ def main():
                 if _combined_ext:
                     _pending.append(
                         (filename_for(company_name, "extract", "txt"), _combined_ext, "text/plain")
+                    )
+                _interim = st.session_state.get("interim_notes_text", "")
+                if _interim:
+                    _pending.append(
+                        (filename_for(company_name, "interim", "txt"), _interim, "text/plain")
                     )
                 st.session_state["pending_auto_download"] = _pending
 

@@ -1469,15 +1469,20 @@ def main():
                 st.session_state["target_words"]     = word_count
 
                 # ── Stage auto-download — fires once on the next render ─────
-                # Two formats with the same content: .md (for markdown viewers)
-                # and .txt (for plain-text consumers). Filenames follow the
-                # YYYYMMDD_<company>_<kind>.<ext> pattern.
-                md_filename  = filename_for(company_name, "synthnotes", "md")
-                txt_filename = filename_for(company_name, "synthnotes", "txt")
-                st.session_state["pending_auto_download"] = [
-                    (md_filename,  final_doc, "text/markdown"),
-                    (txt_filename, final_doc, "text/plain"),
+                # Final document in two formats (.md, .txt) + interim notes (.txt).
+                # Interim is the Map-stage cache — also auto-downloaded so the
+                # user can later resume synthesis without re-paying for Map even
+                # if the session dies. All filenames follow YYYYMMDD_<company>_<kind>.<ext>.
+                _pending: List[Tuple[str, str, str]] = [
+                    (filename_for(company_name, "synthnotes", "md"),  final_doc, "text/markdown"),
+                    (filename_for(company_name, "synthnotes", "txt"), final_doc, "text/plain"),
                 ]
+                _interim = st.session_state.get("interim_notes_text", "")
+                if _interim:
+                    _pending.append(
+                        (filename_for(company_name, "interim", "txt"), _interim, "text/plain")
+                    )
+                st.session_state["pending_auto_download"] = _pending
 
                 actual_words = len(final_doc.split())
                 pct_of_target = actual_words / word_count * 100
