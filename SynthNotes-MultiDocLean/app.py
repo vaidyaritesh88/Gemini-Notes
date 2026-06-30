@@ -786,6 +786,13 @@ def render_usage_panel():
             st.rerun()
 
 
+class _PipelineComplete(Exception):
+    """Sentinel raised inside the pipeline try-block to short-circuit cleanly.
+    Caught right before the generic Exception handler — no error UI, no st.stop().
+    Used by the extraction-only short-circuit so the output renderer still runs
+    on the same script execution and shows the combined-extract download."""
+
+
 # ── 4. CORE PROCESSING (extract → map → reduce) ────────────────────────────────
 
 # ── Stage 0: extraction (per-source-type) ──────────────────────────────────────
@@ -1553,8 +1560,19 @@ def main():
             ar_words_total, tx_words_total, word_count,
             extract_model_id, map_model_id, reduce_model_id,
         )
+        # Scope cost to whatever stages will actually run.
+        # NOTE: stop_after_extraction is defined just below this block, so we
+        # re-derive it from session state here (radio key="pipeline_scope").
+        _scope_value = st.session_state.get("pipeline_scope", "Full pipeline")
+        _ext_only    = isinstance(_scope_value, str) and _scope_value.startswith("Extraction only")
+        if _ext_only:
+            run_cost = est["extract_cost"]
+            run_desc = "Extraction only (Stage 0)"
+        else:
+            run_cost = est["total_cost"]
+            run_desc = "Full pipeline (Extract → Map → Reduce)"
         with st.expander(
-            f"💰 Estimated cost for this run: **~${est['total_cost']:.2f}**",
+            f"💰 Estimated cost for this run: **~${run_cost:.2f}**  ({run_desc})",
             expanded=False,
         ):
             st.caption(
@@ -1580,10 +1598,38 @@ def main():
                 f"Extracted estimate: ~{est['extracted_words']:,} words feeding synthesis."
             )
 
+    # ── Pipeline scope (extraction-only short-circuit) ─────────────────────────
+    # Only relevant in source-files mode (interim mode always runs Reduce-only).
+    stop_after_extraction = False
+    if not is_interim_mode:
+        st.markdown("### 8. Pipeline scope")
+        scope_choice = st.radio(
+            "How far to run",
+            [
+                "Full pipeline — Extract → Map → Reduce → final document",
+                "Extraction only — just produce the combined extracted .txt and stop",
+            ],
+            index=0,
+            key="pipeline_scope",
+            label_visibility="collapsed",
+            help=(
+                "**Full pipeline (default)** — runs the whole thing end-to-end.\n\n"
+                "**Extraction only** — runs Stage 0 (extraction) and stops. Produces the "
+                "combined extracted .txt file, which you can download and use for anything: "
+                "feed into MultiDoc, paste into Gemini AI Studio, hand to a colleague, archive. "
+                "Skips Map + Reduce entirely — synthesis prompt and target length are ignored "
+                "in this mode."
+            ),
+        )
+        stop_after_extraction = scope_choice.startswith("Extraction only")
+
     # ── Process ────────────────────────────────────────────────────────────────
     st.divider()
-    if st.button("Generate consolidated document", type="primary", use_container_width=True):
-        if not user_prompt.strip():
+    button_label = "Generate consolidated document"
+    if stop_after_extraction:
+        button_label = "Run extraction only (produce combined .txt and stop)"
+    if st.button(button_label, type="primary", use_container_width=True):
+        if not stop_after_extraction and not user_prompt.strip():
             st.error("Please provide a synthesis prompt.")
             st.stop()
 
@@ -1691,6 +1737,26 @@ def main():
                     st.session_state["combined_extract_text"] = serialize_combined_extract(
                         extracted_ar, extracted_transcripts,
                     )
+                    # Track sources for the output renderer
+                    st.session_state["ar_filenames"] = [f[0] for f in extracted_ar]
+                    st.session_state["transcript_filenames"] = [f[0] for f in extracted_transcripts]
+
+                    # ── EARLY EXIT: stop after extraction ─────────────────────
+                    # We use a sentinel exception (NOT st.stop) so the script still
+                    # runs to completion — including the output-rendering block below
+                    # the button handler, which is what shows the download UI.
+                    if stop_after_extraction:
+                        st.session_state["stopped_after"]  = "extraction"
+                        # Clear any prior final document so the output renderer
+                        # doesn't show a stale full-pipeline result
+                        st.session_state.pop("final_document", None)
+                        st.session_state.pop("interim_notes_text", None)
+                        status.update(label="Done — stopped after extraction", state="complete")
+                        st.write(
+                            f"**✓ Combined extracted .txt ready** — {extracted_words:,} words. "
+                            f"Download from the output section below."
+                        )
+                        raise _PipelineComplete()
 
                     # Feed extracted content into the existing Map pipeline as if they
                     # were original files. Per-source attribution preserved naturally.
@@ -1767,97 +1833,142 @@ def main():
                     f"({pct_of_target:.0f}% of {word_count:,}-word target)"
                 )
 
+            except _PipelineComplete:
+                # Normal early exit (e.g., "extraction only" mode). Already logged
+                # inside the try block; nothing else to do here.
+                pass
             except Exception as e:
                 status.update(label="Failed", state="error")
                 st.error(f"**Error:** {e}")
 
     # ── Output ─────────────────────────────────────────────────────────────────
-    if "final_document" in st.session_state:
+    stopped = st.session_state.get("stopped_after", "")
+    if "final_document" in st.session_state or stopped == "extraction":
         st.divider()
-        doc          = st.session_state["final_document"]
         sources      = st.session_state.get("source_filenames", [])
         target       = st.session_state.get("target_words", 0)
         interim_text  = st.session_state.get("interim_notes_text", "")
         combined_extract_text = st.session_state.get("combined_extract_text", "")
+        ar_names = st.session_state.get("ar_filenames", [])
+        tx_names = st.session_state.get("transcript_filenames", [])
 
-        col_title, col_copy, col_md, col_pdf = st.columns([2, 1, 1, 1])
-        with col_title:
-            actual = len(doc.split())
-            st.subheader(f"Consolidated Document  ({actual:,} words)")
-        with col_copy:
-            copy_button(doc, "Copy")
-        with col_md:
-            st.download_button(
-                "Download .md",
-                data=doc,
-                file_name="synthnotes_multidoclean_output.md",
-                mime="text/markdown",
-                use_container_width=True,
-                key="dl_final_md",
-            )
-        with col_pdf:
-            # PDF generation is best-effort; if deps are missing it degrades gracefully
-            pdf_bytes = markdown_to_pdf_bytes(doc)
-            if pdf_bytes:
+        if stopped == "extraction":
+            # ── Extraction-only mode — combined extract is THE deliverable ──
+            ext_words = len(combined_extract_text.split())
+            col_title, col_copy, col_dl = st.columns([2, 1, 1])
+            with col_title:
+                st.subheader(f"Combined Extracted Content  ({ext_words:,} words)")
+            with col_copy:
+                copy_button(combined_extract_text, "Copy")
+            with col_dl:
                 st.download_button(
-                    "Download .pdf",
-                    data=pdf_bytes,
-                    file_name="synthnotes_multidoclean_output.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                    key="dl_final_pdf",
-                )
-            else:
-                st.caption("PDF unavailable — install `markdown` and `xhtml2pdf` (see requirements.txt)")
-
-        with st.expander(f"Source documents used ({len(sources)})", expanded=False):
-            for s in sources:
-                st.text(f"  • {s}")
-
-        # Combined extracted text — portable artefact you can paste into other tools
-        if combined_extract_text:
-            with st.expander("📋 Combined extracted text (portable — usable in other tools)", expanded=False):
-                st.caption(
-                    "The combined extracted text from Stage 0 — what survived extraction from "
-                    "all ARs and transcripts, with `==== From: filename ====` headers between "
-                    "sources. Download to paste into MultiDoc, Gemini AI Studio, or any other "
-                    "tool. This is the input that fed Map+Reduce in this run."
-                )
-                ext_words = len(combined_extract_text.split())
-                st.caption(f"~{ext_words:,} words across all extracted sources")
-                st.download_button(
-                    "Download combined extract (.txt)",
+                    "Download .txt",
                     data=combined_extract_text,
                     file_name="synthnotes_multidoclean_extract.txt",
                     mime="text/plain",
                     use_container_width=True,
-                    key="dl_combined_extract",
+                    key="dl_extract_primary",
                 )
-
-        # Interim notes download — lets the user re-run synthesis later without re-paying for Map
-        if interim_text:
-            with st.expander("💾 Save interim notes (for re-running synthesis later)", expanded=False):
-                st.caption(
-                    "The interim file holds the Map-stage output (per-section notes). "
-                    "Download it now — next time, switch **Input mode** to "
-                    "*Saved interim notes* and upload this file to skip the expensive Map "
-                    "stage and re-run synthesis with a different prompt or length."
-                )
-                interim_section_count = max(0, interim_text.count(INTERIM_SECTION_SEPARATOR) - 1)
-                interim_word_count = len(interim_text.split())
-                st.caption(
-                    f"~{interim_word_count:,} words across {interim_section_count} section(s) of intermediate notes"
-                )
+            st.caption(
+                "Pipeline stopped after Stage 0 (extraction). Map + Reduce were skipped. "
+                "Use this .txt as input to MultiDoc, paste into Gemini AI Studio, or pass to "
+                "any other tool. To run the full pipeline, switch **Pipeline scope** above to "
+                "*Full pipeline* and click Generate again."
+            )
+            with st.expander(
+                f"Source files used (AR: {len(ar_names)}, transcripts: {len(tx_names)})",
+                expanded=False,
+            ):
+                if ar_names:
+                    st.markdown("**Annual reports:**")
+                    for s in ar_names:
+                        st.text(f"  • {s}")
+                if tx_names:
+                    st.markdown("**Quarterly transcripts:**")
+                    for s in tx_names:
+                        st.text(f"  • {s}")
+            st.markdown(combined_extract_text)
+        else:
+            # ── Full pipeline — final document is THE deliverable ────────────
+            doc = st.session_state["final_document"]
+            col_title, col_copy, col_md, col_pdf = st.columns([2, 1, 1, 1])
+            with col_title:
+                actual = len(doc.split())
+                st.subheader(f"Consolidated Document  ({actual:,} words)")
+            with col_copy:
+                copy_button(doc, "Copy")
+            with col_md:
                 st.download_button(
-                    "Download interim notes (.txt)",
-                    data=interim_text,
-                    file_name="synthnotes_multidoclean_interim.txt",
-                    mime="text/plain",
+                    "Download .md",
+                    data=doc,
+                    file_name="synthnotes_multidoclean_output.md",
+                    mime="text/markdown",
                     use_container_width=True,
-                    key="dl_interim",
+                    key="dl_final_md",
                 )
+            with col_pdf:
+                # PDF generation is best-effort; if deps are missing it degrades gracefully
+                pdf_bytes = markdown_to_pdf_bytes(doc)
+                if pdf_bytes:
+                    st.download_button(
+                        "Download .pdf",
+                        data=pdf_bytes,
+                        file_name="synthnotes_multidoclean_output.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                        key="dl_final_pdf",
+                    )
+                else:
+                    st.caption("PDF unavailable — install `markdown` and `xhtml2pdf` (see requirements.txt)")
 
-        st.markdown(doc)
+            with st.expander(f"Source documents used ({len(sources)})", expanded=False):
+                for s in sources:
+                    st.text(f"  • {s}")
+
+            # Combined extracted text — portable artefact you can paste into other tools
+            if combined_extract_text:
+                with st.expander("📋 Combined extracted text (portable — usable in other tools)", expanded=False):
+                    st.caption(
+                        "The combined extracted text from Stage 0 — what survived extraction from "
+                        "all ARs and transcripts, with `==== From: filename ====` headers between "
+                        "sources. Download to paste into MultiDoc, Gemini AI Studio, or any other "
+                        "tool. This is the input that fed Map+Reduce in this run."
+                    )
+                    ext_words = len(combined_extract_text.split())
+                    st.caption(f"~{ext_words:,} words across all extracted sources")
+                    st.download_button(
+                        "Download combined extract (.txt)",
+                        data=combined_extract_text,
+                        file_name="synthnotes_multidoclean_extract.txt",
+                        mime="text/plain",
+                        use_container_width=True,
+                        key="dl_combined_extract",
+                    )
+
+            # Interim notes download — lets the user re-run synthesis later without re-paying for Map
+            if interim_text:
+                with st.expander("💾 Save interim notes (for re-running synthesis later)", expanded=False):
+                    st.caption(
+                        "The interim file holds the Map-stage output (per-section notes). "
+                        "Download it now — next time, switch **Input mode** to "
+                        "*Saved interim notes* and upload this file to skip the expensive Map "
+                        "stage and re-run synthesis with a different prompt or length."
+                    )
+                    interim_section_count = max(0, interim_text.count(INTERIM_SECTION_SEPARATOR) - 1)
+                    interim_word_count = len(interim_text.split())
+                    st.caption(
+                        f"~{interim_word_count:,} words across {interim_section_count} section(s) of intermediate notes"
+                    )
+                    st.download_button(
+                        "Download interim notes (.txt)",
+                        data=interim_text,
+                        file_name="synthnotes_multidoclean_interim.txt",
+                        mime="text/plain",
+                        use_container_width=True,
+                        key="dl_interim",
+                    )
+
+            st.markdown(doc)
 
     # ── Cost panel ─────────────────────────────────────────────────────────────
     render_usage_panel()
