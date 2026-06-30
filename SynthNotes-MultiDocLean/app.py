@@ -25,6 +25,7 @@ from SynthNotes-MultiDoc; this is a separate self-contained app.
 import streamlit as st
 import google.generativeai as genai
 import os, re, time, json, html as html_module
+from datetime import datetime
 from typing import Optional, Tuple, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
@@ -706,6 +707,57 @@ def create_chunks_with_overlap(text: str, chunk_size: int, overlap: int) -> List
         if i + chunk_size >= len(words):
             break
     return chunks
+
+
+# ── Filename + auto-download helpers ──────────────────────────────────────────
+# Auto-download mitigates Streamlit session loss: as soon as a run completes,
+# the output is written to the user's disk so even if the session times out or
+# the tab is refreshed, the file is already saved locally.
+
+def _sanitize_filename_component(s: str, fallback: str = "untitled") -> str:
+    """Make a string safe for use in a filename. Replaces runs of non-alphanumerics
+    with a single underscore; falls back to 'untitled' for empty/blank input."""
+    if s is None:
+        return fallback
+    s = s.strip()
+    if not s:
+        return fallback
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_")
+    return safe or fallback
+
+
+def filename_for(company_name: str, kind: str, ext: str) -> str:
+    """Build a filename like '20260628_Hitachi_Energy_extract.txt'.
+    Date is today's date in YYYYMMDD; kind is the document type label."""
+    date_str = datetime.now().strftime("%Y%m%d")
+    company  = _sanitize_filename_component(company_name)
+    kind_safe = _sanitize_filename_component(kind, fallback="output")
+    ext_safe  = ext.lstrip(".")
+    return f"{date_str}_{company}_{kind_safe}.{ext_safe}"
+
+
+def auto_download_files(files: List[Tuple[str, str, str]]) -> None:
+    """Trigger browser downloads for one or more text files via injected JS.
+    See SynthNotes-MultiDoc for design notes — same mechanism."""
+    if not files:
+        return
+    blocks = []
+    for i, (filename, content, mime) in enumerate(files):
+        delay_ms = i * 600
+        blocks.append(
+            f"setTimeout(function() {{\n"
+            f"  var blob = new Blob([{json.dumps(content)}], {{type: {json.dumps(mime)}}});\n"
+            f"  var url = URL.createObjectURL(blob);\n"
+            f"  var a = document.createElement('a');\n"
+            f"  a.href = url;\n"
+            f"  a.download = {json.dumps(filename)};\n"
+            f"  document.body.appendChild(a);\n"
+            f"  a.click();\n"
+            f"  setTimeout(function() {{ URL.revokeObjectURL(url); document.body.removeChild(a); }}, 200);\n"
+            f"}}, {delay_ms});"
+        )
+    js = "\n".join(blocks)
+    components.html(f"<script>{js}</script>", height=0)
 
 
 def copy_button(text: str, label: str = "Copy"):
@@ -1403,6 +1455,19 @@ def main():
         )
 
     # ── Mode toggle ────────────────────────────────────────────────────────────
+    # ── Company name (used in download filenames; auto-downloads use this) ─────
+    company_name = st.text_input(
+        "Company name (used in auto-downloaded filenames; optional)",
+        placeholder="e.g. Hitachi Energy",
+        key="company_name",
+        help=(
+            "Used to name auto-downloaded files: "
+            "**YYYYMMDD_<company>_synthnotes.md/.txt** for the final document, "
+            "**YYYYMMDD_<company>_extract.txt** for the combined extracted text. "
+            "If blank, files are named with 'untitled' instead."
+        ),
+    )
+
     st.markdown("### 1. Input mode")
     mode = st.radio(
         "Start from",
@@ -1756,6 +1821,14 @@ def main():
                             f"**✓ Combined extracted .txt ready** — {extracted_words:,} words. "
                             f"Download from the output section below."
                         )
+                        # Stage auto-download — fires once on the next render
+                        st.session_state["pending_auto_download"] = [
+                            (
+                                filename_for(company_name, "extract", "txt"),
+                                st.session_state["combined_extract_text"],
+                                "text/plain",
+                            ),
+                        ]
                         raise _PipelineComplete()
 
                     # Feed extracted content into the existing Map pipeline as if they
@@ -1825,6 +1898,21 @@ def main():
                 st.session_state["source_filenames"] = filenames
                 st.session_state["target_words"]     = word_count
 
+                # ── Stage auto-download — fires once on the next render ─────
+                # Full pipeline: auto-download the final document as .md + .txt,
+                # plus the combined extract as .txt (in case session is lost
+                # before user manually downloads).
+                _pending: List[Tuple[str, str, str]] = [
+                    (filename_for(company_name, "synthnotes", "md"),  final_doc, "text/markdown"),
+                    (filename_for(company_name, "synthnotes", "txt"), final_doc, "text/plain"),
+                ]
+                _combined_ext = st.session_state.get("combined_extract_text", "")
+                if _combined_ext:
+                    _pending.append(
+                        (filename_for(company_name, "extract", "txt"), _combined_ext, "text/plain")
+                    )
+                st.session_state["pending_auto_download"] = _pending
+
                 actual_words = len(final_doc.split())
                 pct_of_target = actual_words / word_count * 100
                 status.update(label="Done!", state="complete")
@@ -1840,6 +1928,19 @@ def main():
             except Exception as e:
                 status.update(label="Failed", state="error")
                 st.error(f"**Error:** {e}")
+
+    # ── Auto-download trigger — fires exactly once after a successful run ─────
+    # Popped so it doesn't re-fire on subsequent reruns. Works for both full
+    # pipeline (final doc .md+.txt, plus extract .txt) and extraction-only
+    # (just the combined extract .txt).
+    _pending_dl = st.session_state.pop("pending_auto_download", None)
+    if _pending_dl:
+        auto_download_files(_pending_dl)
+        st.success(
+            "✓ Auto-downloaded to your downloads folder: " +
+            " · ".join(f"`{f[0]}`" for f in _pending_dl) +
+            "  *(first multi-file download per site may prompt your browser to allow it)*"
+        )
 
     # ── Output ─────────────────────────────────────────────────────────────────
     stopped = st.session_state.get("stopped_after", "")
@@ -1864,7 +1965,7 @@ def main():
                 st.download_button(
                     "Download .txt",
                     data=combined_extract_text,
-                    file_name="synthnotes_multidoclean_extract.txt",
+                    file_name=filename_for(company_name, "extract", "txt"),
                     mime="text/plain",
                     use_container_width=True,
                     key="dl_extract_primary",
@@ -1901,7 +2002,7 @@ def main():
                 st.download_button(
                     "Download .md",
                     data=doc,
-                    file_name="synthnotes_multidoclean_output.md",
+                    file_name=filename_for(company_name, "synthnotes", "md"),
                     mime="text/markdown",
                     use_container_width=True,
                     key="dl_final_md",
@@ -1913,7 +2014,7 @@ def main():
                     st.download_button(
                         "Download .pdf",
                         data=pdf_bytes,
-                        file_name="synthnotes_multidoclean_output.pdf",
+                        file_name=filename_for(company_name, "synthnotes", "pdf"),
                         mime="application/pdf",
                         use_container_width=True,
                         key="dl_final_pdf",
@@ -1939,7 +2040,7 @@ def main():
                     st.download_button(
                         "Download combined extract (.txt)",
                         data=combined_extract_text,
-                        file_name="synthnotes_multidoclean_extract.txt",
+                        file_name=filename_for(company_name, "extract", "txt"),
                         mime="text/plain",
                         use_container_width=True,
                         key="dl_combined_extract",
@@ -1962,7 +2063,7 @@ def main():
                     st.download_button(
                         "Download interim notes (.txt)",
                         data=interim_text,
-                        file_name="synthnotes_multidoclean_interim.txt",
+                        file_name=filename_for(company_name, "interim", "txt"),
                         mime="text/plain",
                         use_container_width=True,
                         key="dl_interim",

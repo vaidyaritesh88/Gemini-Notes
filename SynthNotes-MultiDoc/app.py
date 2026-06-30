@@ -18,6 +18,7 @@ this is a separate self-contained app (no imports from sibling apps).
 import streamlit as st
 import google.generativeai as genai
 import os, re, time, json, html as html_module
+from datetime import datetime
 from typing import Optional, Tuple, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
@@ -569,6 +570,68 @@ def create_chunks_with_overlap(text: str, chunk_size: int, overlap: int) -> List
     return chunks
 
 
+# ── Filename + auto-download helpers ──────────────────────────────────────────
+# Auto-download mitigates the Streamlit session-loss problem: as soon as a run
+# completes, the output is written to the user's disk so even if the session
+# times out or the tab is refreshed, the file is already saved locally.
+
+def _sanitize_filename_component(s: str, fallback: str = "untitled") -> str:
+    """Make a string safe for use in a filename. Replaces runs of non-alphanumerics
+    with a single underscore; falls back to 'untitled' for empty/blank input."""
+    if s is None:
+        return fallback
+    s = s.strip()
+    if not s:
+        return fallback
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_")
+    return safe or fallback
+
+
+def filename_for(company_name: str, kind: str, ext: str) -> str:
+    """Build a filename like '20260628_Hitachi_Energy_synthnotes.md'.
+    Date is today's date in YYYYMMDD; kind is the document type label."""
+    date_str = datetime.now().strftime("%Y%m%d")
+    company  = _sanitize_filename_component(company_name)
+    kind_safe = _sanitize_filename_component(kind, fallback="output")
+    ext_safe  = ext.lstrip(".")
+    return f"{date_str}_{company}_{kind_safe}.{ext_safe}"
+
+
+def auto_download_files(files: List[Tuple[str, str, str]]) -> None:
+    """Trigger browser downloads for one or more text files via injected JS.
+
+    Args:
+        files: list of (filename, content, mime_type) tuples.
+
+    Mechanism: creates an invisible iframe (height=0), inside it a small script
+    builds a Blob URL per file, creates an <a download> element, and clicks it.
+    Multiple files are staggered by 600ms so most browsers don't block them.
+
+    Browser quirk: first multi-file auto-download per origin prompts the user
+    to allow multiple downloads on this site. After that it's silent.
+    """
+    if not files:
+        return
+    blocks = []
+    for i, (filename, content, mime) in enumerate(files):
+        delay_ms = i * 600
+        # json.dumps gives us properly-escaped JS string literals for filename + content
+        blocks.append(
+            f"setTimeout(function() {{\n"
+            f"  var blob = new Blob([{json.dumps(content)}], {{type: {json.dumps(mime)}}});\n"
+            f"  var url = URL.createObjectURL(blob);\n"
+            f"  var a = document.createElement('a');\n"
+            f"  a.href = url;\n"
+            f"  a.download = {json.dumps(filename)};\n"
+            f"  document.body.appendChild(a);\n"
+            f"  a.click();\n"
+            f"  setTimeout(function() {{ URL.revokeObjectURL(url); document.body.removeChild(a); }}, 200);\n"
+            f"}}, {delay_ms});"
+        )
+    js = "\n".join(blocks)
+    components.html(f"<script>{js}</script>", height=0)
+
+
 def copy_button(text: str, label: str = "Copy"):
     theme = st.context.theme
     bg = theme.get("primaryColor", "#FF4B4B")
@@ -1106,6 +1169,19 @@ def main():
             ),
         )
 
+    # ── Company name (used in download filenames; auto-downloads use this) ─────
+    company_name = st.text_input(
+        "Company name (used in auto-downloaded filenames; optional)",
+        placeholder="e.g. Hitachi Energy",
+        key="company_name",
+        help=(
+            "Used to name auto-downloaded files: "
+            "**YYYYMMDD_<company>_synthnotes.md/.txt**. "
+            "If left blank, files are named with 'untitled' instead. "
+            "Special characters get replaced with underscores so the name is filesystem-safe."
+        ),
+    )
+
     # ── Mode toggle ────────────────────────────────────────────────────────────
     st.markdown("### 1. Input mode")
     mode = st.radio(
@@ -1392,6 +1468,17 @@ def main():
                 st.session_state["source_filenames"] = filenames
                 st.session_state["target_words"]     = word_count
 
+                # ── Stage auto-download — fires once on the next render ─────
+                # Two formats with the same content: .md (for markdown viewers)
+                # and .txt (for plain-text consumers). Filenames follow the
+                # YYYYMMDD_<company>_<kind>.<ext> pattern.
+                md_filename  = filename_for(company_name, "synthnotes", "md")
+                txt_filename = filename_for(company_name, "synthnotes", "txt")
+                st.session_state["pending_auto_download"] = [
+                    (md_filename,  final_doc, "text/markdown"),
+                    (txt_filename, final_doc, "text/plain"),
+                ]
+
                 actual_words = len(final_doc.split())
                 pct_of_target = actual_words / word_count * 100
                 status.update(label="Done!", state="complete")
@@ -1405,6 +1492,18 @@ def main():
                 st.error(f"**Error:** {e}")
 
     # ── Output ─────────────────────────────────────────────────────────────────
+    # ── Auto-download trigger — fires exactly once after a successful run ─────
+    # Popped so it doesn't re-fire on subsequent reruns (e.g., when the user
+    # changes a model dropdown). Manual download buttons remain available below.
+    _pending_dl = st.session_state.pop("pending_auto_download", None)
+    if _pending_dl:
+        auto_download_files(_pending_dl)
+        st.success(
+            "✓ Auto-downloaded to your downloads folder: " +
+            " · ".join(f"`{f[0]}`" for f in _pending_dl) +
+            "  *(first multi-file download per site may prompt your browser to allow it)*"
+        )
+
     if "final_document" in st.session_state:
         st.divider()
         doc          = st.session_state["final_document"]
@@ -1422,7 +1521,7 @@ def main():
             st.download_button(
                 "Download .md",
                 data=doc,
-                file_name="synthnotes_multidoc_output.md",
+                file_name=filename_for(company_name, "synthnotes", "md"),
                 mime="text/markdown",
                 use_container_width=True,
                 key="dl_final_md",
@@ -1434,7 +1533,7 @@ def main():
                 st.download_button(
                     "Download .pdf",
                     data=pdf_bytes,
-                    file_name="synthnotes_multidoc_output.pdf",
+                    file_name=filename_for(company_name, "synthnotes", "pdf"),
                     mime="application/pdf",
                     use_container_width=True,
                     key="dl_final_pdf",
@@ -1463,7 +1562,7 @@ def main():
                 st.download_button(
                     "Download interim notes (.txt)",
                     data=interim_text,
-                    file_name="synthnotes_multidoc_interim.txt",
+                    file_name=filename_for(company_name, "interim", "txt"),
                     mime="text/plain",
                     use_container_width=True,
                     key="dl_interim",
