@@ -333,6 +333,14 @@ CHRONOLOGY_NOTE: [one sentence about how sections are ordered, e.g. "Sections ar
 5. Do NOT write any prose body — only the outline structure.
 6. The COVERAGE line for each section should be specific enough that a separate writer could write JUST that section knowing only its coverage description and the source notes.
 
+### STRICT FORMAT REQUIREMENTS (a downstream parser depends on these)
+- Each section heading MUST begin with `## ` (two hashes then a space). Not `###`, not `**bold**`, not numbered. Exactly `## `.
+- Each section MUST include both lines below the heading:
+  `- Coverage: …`
+  `- Word budget: ~N words`  (with a number; the parser extracts the first integer)
+- Do not omit either line for any section. If a section is short, still include both labels.
+- Use the exact label words "Coverage" and "Word budget" (case-insensitive but spelled exactly).
+
 Produce the outline now. Begin immediately with `# [title]`.
 """
 
@@ -785,41 +793,89 @@ def _generate_outline(
     return resp.text
 
 
-def _parse_outline(outline_text: str) -> List[dict]:
-    """Extract sections from the outline text. Returns a list of dicts:
-    [{'heading': str, 'coverage': str, 'budget': int}, ...]
+# Heading detection patterns — accept several styles the model might use
+_HEADING_PATTERNS = (
+    re.compile(r"^#{2,4}\s+(\S.*?)\s*:?\s*$"),         # ## Heading  / ### Heading  / #### Heading
+    re.compile(r"^\*\*([^*]+?)\*\*\s*:?\s*$"),          # **Heading**
+    re.compile(r"^\d+\.\s+(\S.*?)\s*:?\s*$"),          # 1. Heading
+)
+_COVERAGE_RE = re.compile(
+    r"^[-*]?\s*(?:Coverage|Covers|Description|Content|What\s+it\s+covers)\s*:\s*(.+)$",
+    re.IGNORECASE,
+)
+_BUDGET_RE = re.compile(
+    r"^[-*]?\s*(?:Word\s*budget|Words|Length|Target\s*words?|Budget|Approx\.?\s*words)\s*:\s*(.+)$",
+    re.IGNORECASE,
+)
 
-    Robust to minor format variations from the model. Returns [] if parsing
-    fails (caller should fall back to single-pass reduce in that case)."""
-    sections = []
+
+def _parse_outline(outline_text: str) -> List[dict]:
+    """Extract sections from the outline text. Lenient about format variations
+    so that minor drift in the model's output doesn't drop us to single-pass.
+
+    Accepts:
+      - Headings: ## Title, ### Title, **Title**, or '1. Title'
+      - Coverage labels: 'Coverage', 'Covers', 'Description', 'Content', 'What it covers'
+      - Budget labels: 'Word budget', 'Words', 'Length', 'Target words', 'Budget', 'Approx words'
+      - With or without leading '-' or '*' bullet markers
+      - Trailing ':' on heading lines tolerated
+
+    Sections without a parsed word budget are kept with budget=0; the caller
+    is expected to assign a default rather than drop them. Sections with no
+    heading are dropped.
+    """
+    sections: List[dict] = []
     current: Optional[dict] = None
+
+    # Markers we should NOT treat as section headings even though they match a heading pattern
+    _META_PREFIXES = ("TOTAL", "CHRONOLOGY_NOTE", "DOCUMENT TITLE")
+
+    def flush():
+        nonlocal current
+        if current and current.get("heading"):
+            sections.append(current)
+        current = None
 
     for raw_line in outline_text.split("\n"):
         line = raw_line.strip()
-        # New section starts on a '## ' heading (NOT '# ' which is the document title)
-        if line.startswith("## "):
-            if current and current.get("heading"):
-                sections.append(current)
-            current = {"heading": line[3:].strip(), "coverage": "", "budget": 0}
-        elif current is not None:
-            # Coverage line
-            cov_match = re.match(r"-\s*Coverage\s*:\s*(.+)$", line, re.IGNORECASE)
-            if cov_match:
-                current["coverage"] = cov_match.group(1).strip()
-                continue
-            # Word budget line — extract first number
-            bud_match = re.match(r"-\s*Word\s*budget\s*:\s*(.+)$", line, re.IGNORECASE)
-            if bud_match:
-                num = re.search(r"(\d+)", bud_match.group(1))
-                if num:
-                    current["budget"] = int(num.group(1))
-                continue
+        if not line:
+            continue
 
-    if current and current.get("heading"):
-        sections.append(current)
+        # Try heading patterns in order
+        heading_text = None
+        for pat in _HEADING_PATTERNS:
+            m = pat.match(line)
+            if not m:
+                continue
+            candidate = m.group(1).strip()
+            if candidate.upper().startswith(_META_PREFIXES):
+                continue
+            heading_text = candidate
+            break
 
-    # Filter out malformed sections (no budget set)
-    return [s for s in sections if s["heading"] and s["budget"] > 0]
+        if heading_text:
+            flush()
+            current = {"heading": heading_text, "coverage": "", "budget": 0}
+            continue
+
+        if current is None:
+            continue
+
+        cov_m = _COVERAGE_RE.match(line)
+        if cov_m:
+            current["coverage"] = cov_m.group(1).strip()
+            continue
+
+        bud_m = _BUDGET_RE.match(line)
+        if bud_m:
+            num = re.search(r"(\d+)", bud_m.group(1))
+            if num:
+                current["budget"] = int(num.group(1))
+            continue
+
+    flush()
+    # Keep sections even without a budget — caller assigns a default
+    return [s for s in sections if s["heading"]]
 
 
 def _extract_outline_metadata(outline_text: str) -> Tuple[Optional[str], Optional[str]]:
@@ -874,8 +930,35 @@ def plan_then_write_final(
     sections = _parse_outline(outline_text)
 
     if not sections:
-        status_write("⚠️  Could not parse outline — falling back to single-pass synthesis")
+        # Show what the model actually returned so we can diagnose drift
+        snippet = outline_text.strip().replace("\n", " ⏎ ")[:500]
+        if len(outline_text.strip()) > 500:
+            snippet += "…"
+        status_write(
+            f"⚠️  Outline parsing found 0 sections — falling back to single-pass synthesis "
+            f"(length compliance may be poor). Model output started with: \"{snippet}\""
+        )
         return _final_reduce(notes_list, filenames, user_prompt, target_word_count, model, status_write)
+
+    # Fill in default word budgets for sections that didn't get one parsed
+    missing_budget = [s for s in sections if s["budget"] <= 0]
+    if missing_budget:
+        already_set = sum(s["budget"] for s in sections if s["budget"] > 0)
+        remaining   = max(target_word_count - already_set, 0)
+        per_missing = remaining // len(missing_budget) if remaining else target_word_count // len(sections)
+        for s in missing_budget:
+            s["budget"] = per_missing
+        if len(missing_budget) == len(sections):
+            status_write(
+                f"ℹ️  Outline parsed but had no per-section word budgets — assigning "
+                f"~{per_missing} words each across {len(sections)} sections."
+            )
+        else:
+            status_write(
+                f"ℹ️  Outline gave word budgets for {len(sections) - len(missing_budget)}/"
+                f"{len(sections)} sections — assigning ~{per_missing} words to each of the "
+                f"remaining {len(missing_budget)}."
+            )
 
     title, chronology_note = _extract_outline_metadata(outline_text)
     total_budget = sum(s["budget"] for s in sections)
