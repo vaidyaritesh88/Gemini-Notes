@@ -1,6 +1,7 @@
 import streamlit as st
 import google.generativeai as genai
 import os, io, re, time, tempfile, json, html as html_module, subprocess, glob
+from datetime import datetime
 from typing import Optional, Tuple, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
@@ -1188,6 +1189,82 @@ def parse_two_tier_summary(text: str) -> Tuple[str, str]:
 
 # ── 12. UI HELPERS ─────────────────────────────────────────────────────────────
 
+# ── Filename + auto-download helpers ──────────────────────────────────────────
+# Auto-download mitigates the Streamlit session-loss problem: as soon as a run
+# completes, the transcript / notes / intelligence brief / summary are written to
+# the user's disk. Even if the session times out or the tab is refreshed, files
+# are already saved locally.
+
+def _sanitize_filename_component(s: str, fallback: str = "untitled") -> str:
+    """Make a string safe for use in a filename. Replaces runs of non-alphanumerics
+    with a single underscore; falls back to 'untitled' for empty/blank input."""
+    if s is None:
+        return fallback
+    s = s.strip()
+    if not s:
+        return fallback
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_")
+    return safe or fallback
+
+
+def filename_for(meeting_name: str, kind: str, ext: str) -> str:
+    """Build a filename like '20260628_JPMorgan_expert_call_notes.md'.
+    Date is today's date in YYYYMMDD; kind is the document type label."""
+    date_str = datetime.now().strftime("%Y%m%d")
+    name  = _sanitize_filename_component(meeting_name)
+    kind_safe = _sanitize_filename_component(kind, fallback="output")
+    ext_safe  = ext.lstrip(".")
+    return f"{date_str}_{name}_{kind_safe}.{ext_safe}"
+
+
+def auto_download_files(files: List[Tuple[str, str, str]]) -> None:
+    """Trigger browser downloads for one or more text files via injected JS.
+
+    Args:
+        files: list of (filename, content, mime_type) tuples.
+
+    Mechanism: creates an invisible iframe (height=0), inside it a small script
+    builds a Blob URL per file, creates an <a download> element, and clicks it.
+    Multiple files are staggered by 600ms so most browsers don't block them.
+
+    Browser quirk: first multi-file auto-download per origin prompts the user
+    to allow multiple downloads on this site. After that it's silent.
+    """
+    if not files:
+        return
+    blocks = []
+    for i, (filename, content, mime) in enumerate(files):
+        delay_ms = i * 600
+        blocks.append(
+            f"setTimeout(function() {{\n"
+            f"  var blob = new Blob([{json.dumps(content)}], {{type: {json.dumps(mime)}}});\n"
+            f"  var url = URL.createObjectURL(blob);\n"
+            f"  var a = document.createElement('a');\n"
+            f"  a.href = url;\n"
+            f"  a.download = {json.dumps(filename)};\n"
+            f"  document.body.appendChild(a);\n"
+            f"  a.click();\n"
+            f"  setTimeout(function() {{ URL.revokeObjectURL(url); document.body.removeChild(a); }}, 200);\n"
+            f"}}, {delay_ms});"
+        )
+    js = "\n".join(blocks)
+    components.html(f"<script>{js}</script>", height=0)
+
+
+def _consume_pending_auto_download():
+    """Pop the pending_auto_download flag from session state and trigger downloads.
+    Call this at the top of the OUTPUT area on any page — the flag was staged by
+    the last successful run so downloads fire exactly once on the next render."""
+    pending = st.session_state.pop("pending_auto_download", None)
+    if pending:
+        auto_download_files(pending)
+        st.success(
+            "✓ Auto-downloaded to your downloads folder: " +
+            " · ".join(f"`{f[0]}`" for f in pending) +
+            "  *(first multi-file download per site may prompt your browser to allow it)*"
+        )
+
+
 def copy_button(text: str, label: str = "Copy"):
     theme = st.context.theme
     bg = theme.get("primaryColor", "#FF4B4B")
@@ -1330,6 +1407,19 @@ def page_process():
         st.session_state["input_method"] = "Paste Text"
 
     st.header("Process Meeting")
+
+    # ── Meeting name (used in auto-downloaded filenames) ──────────────────────
+    meeting_name = st.text_input(
+        "Meeting name / company (used in auto-downloaded filenames; optional)",
+        placeholder="e.g. Hitachi Energy management meeting  /  Dr Patel expert call",
+        key="meeting_name",
+        help=(
+            "Used to name auto-downloaded files: "
+            "**YYYYMMDD_<name>_transcript.txt**, **_notes.md/.txt**, **_intelligence.md/.txt**. "
+            "If blank, files are named with 'untitled' instead. Special characters "
+            "become underscores so the name is filesystem-safe."
+        ),
+    )
 
     with st.sidebar:
         st.markdown("### Model Settings")
@@ -1479,6 +1569,18 @@ def page_process():
                 # Clear any prior summary history when new notes are processed
                 st.session_state.pop("summary_history", None)
 
+                # ── Stage auto-download — fires once on the next render ─────
+                # Three artefacts x formats: transcript.txt, notes .md/.txt,
+                # intelligence .md/.txt. Saves everything of value to disk
+                # so session loss doesn't wipe the run.
+                st.session_state["pending_auto_download"] = [
+                    (filename_for(meeting_name, "transcript",   "txt"), transcript,   "text/plain"),
+                    (filename_for(meeting_name, "notes",        "md"),  notes,        "text/markdown"),
+                    (filename_for(meeting_name, "notes",        "txt"), notes,        "text/plain"),
+                    (filename_for(meeting_name, "intelligence", "md"),  intelligence, "text/markdown"),
+                    (filename_for(meeting_name, "intelligence", "txt"), intelligence, "text/plain"),
+                ]
+
                 status.update(label="Done!", state="complete")
                 st.write("✓ Ready. Go to the **Summary** tab to generate a summary.")
 
@@ -1489,6 +1591,10 @@ def page_process():
     # ── Output ─────────────────────────────────────────────────────────────────
     if "last_notes" in st.session_state:
         st.divider()
+
+        # Trigger any pending auto-download from the last successful run
+        _consume_pending_auto_download()
+
         notes       = st.session_state["last_notes"]
         intelligence = st.session_state.get("last_intelligence", "")
         meeting_type_label = st.session_state.get("last_meeting_type", "")
@@ -1527,6 +1633,19 @@ def page_process():
 def page_summary():
     api_key_check()
     st.header("Summary")
+
+    # ── Meeting name (used in auto-downloaded filenames) ──────────────────────
+    # Shared session-state key with Process page — if user already typed a name there,
+    # it appears here pre-filled; edits here also persist back.
+    meeting_name = st.text_input(
+        "Meeting name / company (used in auto-downloaded filenames; optional)",
+        placeholder="e.g. Hitachi Energy management meeting",
+        key="meeting_name",
+        help=(
+            "Same key as on the Process Meeting page — filling it in either place is enough. "
+            "Used to name auto-downloaded summary files: **YYYYMMDD_<name>_summary.md/.txt**."
+        ),
+    )
 
     with st.sidebar:
         st.markdown("### Model Settings")
@@ -1676,6 +1795,12 @@ def page_summary():
             })
             st.session_state["summary_history"] = history
 
+            # Stage auto-download for the summary in .md + .txt
+            st.session_state["pending_auto_download"] = [
+                (filename_for(meeting_name, "summary", "md"),  summary, "text/markdown"),
+                (filename_for(meeting_name, "summary", "txt"), summary, "text/plain"),
+            ]
+
         except Exception as e:
             status_ph.empty()
             st.error(f"**Error:** {e}")
@@ -1689,6 +1814,9 @@ def page_summary():
     brief, detail = parse_two_tier_summary(current["summary"])
 
     st.divider()
+
+    # Trigger any pending auto-download from the last successful summary run
+    _consume_pending_auto_download()
 
     # Brief in a prominent callout
     col_brief_title, col_brief_copy = st.columns([3, 1])
@@ -1741,6 +1869,11 @@ def page_summary():
                     "word_count":  len(revised.split()),
                 })
                 st.session_state["summary_history"] = history
+                # Stage auto-download for the refined summary too
+                st.session_state["pending_auto_download"] = [
+                    (filename_for(meeting_name, "summary", "md"),  revised, "text/markdown"),
+                    (filename_for(meeting_name, "summary", "txt"), revised, "text/plain"),
+                ]
                 st.rerun()
             except Exception as e:
                 status_ph2.empty()
