@@ -2112,6 +2112,21 @@ def page_transcribe():
         "Useful when you just need the words for something else."
     )
 
+    # ── Meeting name (used in auto-downloaded filenames) ──────────────────────
+    # Shared session-state key with Process Meeting + Summary pages, so filling
+    # it in on any one page pre-fills the others.
+    meeting_name = st.text_input(
+        "Meeting name / company (used in auto-downloaded filenames; optional)",
+        placeholder="e.g. Hitachi Energy management meeting",
+        key="meeting_name",
+        help=(
+            "Same session key as on the Process Meeting and Summary pages. "
+            "Used to name auto-downloaded transcript files: "
+            "**YYYYMMDD_<name>_transcript_raw.txt** (always) and "
+            "**YYYYMMDD_<name>_transcript_refined.txt** (if refinement toggle is on)."
+        ),
+    )
+
     with st.sidebar:
         st.markdown("### Model Settings")
         transcription_model_name = st.selectbox(
@@ -2209,6 +2224,21 @@ def page_transcribe():
                 st.session_state["t_refined_transcript"] = refined_transcript
                 st.session_state["t_source_filename"]    = source_filename
 
+                # ── Stage auto-download — fires once on the next render ─────
+                # Always auto-download the raw transcript. Also auto-download
+                # the refined transcript when refinement ran (the more common
+                # case; refined output is usually what the user wants).
+                _pending: List[Tuple[str, str, str]] = [
+                    (filename_for(meeting_name, "transcript_raw", "txt"),
+                     raw_transcript, "text/plain"),
+                ]
+                if refined_transcript.strip():
+                    _pending.append(
+                        (filename_for(meeting_name, "transcript_refined", "txt"),
+                         refined_transcript, "text/plain")
+                    )
+                st.session_state["pending_auto_download"] = _pending
+
                 status.update(label="Done!", state="complete")
             except Exception as e:
                 status.update(label="Failed", state="error")
@@ -2217,6 +2247,10 @@ def page_transcribe():
     # ── Output ─────────────────────────────────────────────────────────────────
     if "t_raw_transcript" in st.session_state:
         st.divider()
+
+        # Trigger any pending auto-download from the last successful run
+        _consume_pending_auto_download()
+
         raw      = st.session_state["t_raw_transcript"]
         refined  = st.session_state.get("t_refined_transcript", "")
         filename = st.session_state.get("t_source_filename", "transcript")
