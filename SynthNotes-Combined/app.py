@@ -1108,6 +1108,19 @@ def read_uploaded(uploaded_file) -> Tuple[str, str]:
 def main():
     st.set_page_config(page_title="SynthNotes Combined", page_icon="📝", layout="wide")
 
+    # Leave room under the last sidebar widget so dropdown popups never open past
+    # the bottom of the viewport with nowhere to scroll.
+    st.markdown(
+        """
+        <style>
+          section[data-testid="stSidebar"] div[data-testid="stSidebarUserContent"] {
+            padding-bottom: 14rem;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.title("📝 SynthNotes Combined")
     st.caption("Extract → Notes → Synthesise. The two apps you used for transmission research, "
                "joined into one pipeline. Run it end-to-end, or jump in at any stage.")
@@ -1142,7 +1155,9 @@ def main():
 
         st.divider()
         st.subheader("Final note length")
-        length_choice = st.selectbox("Target length", list(LENGTH_PRESETS.keys()), index=1)
+        # Radio rather than a selectbox: this sits low in the sidebar, and a dropdown
+        # popup here opens below the fold. All five options fit inline.
+        length_choice = st.radio("Target length", list(LENGTH_PRESETS.keys()), index=1)
         if LENGTH_PRESETS[length_choice] is None:
             target_word_count = st.number_input("Custom target (words)", min_value=500, max_value=20000, value=4000, step=500)
         else:
