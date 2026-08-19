@@ -182,6 +182,10 @@ found, in order of impact:
 5. The app was on a retired SDK that cannot reach current models.
 
 Also fixed on review: a self-contradiction between "remove nothing else" and the
-tightening rules; a repetition loophole; a length quota in the continuation wrapper;
-missing `₹`/crore/lakh capture in the expert and internal prompts; and voice notes being
-forced into a Q&A structure with no interviewer present.
+tightening rules; a repetition loophole; a length quota in the continuation wrapper; and
+voice notes being forced into a Q&A structure with no interviewer present.
+
+All three note prompts now carry identical figure handling — `$`, `₹`, crore and lakh,
+plus *"reproduce figures in the unit the speaker used — never convert, never round."*
+Keep them in step: this rule drifted once already because the management prompt was
+skipped for having the rupee symbol but not the rest of the rule.
