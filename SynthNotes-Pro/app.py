@@ -1,5 +1,6 @@
 import streamlit as st
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import os, io, re, time, tempfile, json, html as html_module, subprocess, glob
 from datetime import datetime
 from typing import Optional, Tuple, List
@@ -12,8 +13,9 @@ import streamlit.components.v1 as components
 
 load_dotenv()
 _api_key = os.environ.get("GEMINI_API_KEY", "")
-if _api_key:
-    genai.configure(api_key=_api_key)
+# google-genai client. The legacy google-generativeai SDK was retired on 30 Nov 2025 and
+# cannot reach the Gemini 3.x models, so every call now goes through this client.
+_client = genai.Client(api_key=_api_key) if _api_key else None
 
 CHUNK_WORD_SIZE    = 4000
 CHUNK_WORD_OVERLAP = 400
@@ -23,31 +25,54 @@ MAX_OUTPUT_TOKENS  = 65536
 MAX_PDF_MB         = 25
 MAX_AUDIO_MB       = 200
 
+# Audio is cut into segments for transcription, and those segments OVERLAP so that
+# speech landing on a cut boundary is captured whole by at least one neighbour.
+# Without the overlap every seam can swallow a sentence, and the loss is invisible.
+AUDIO_SEGMENT_SECONDS = 300
+AUDIO_OVERLAP_SECONDS = 20
+
+# Live models only, ordered best-quality first. Removed Aug 2026:
+#   gemini-2.0-flash-lite, gemini-1.5-flash  - shut down by Google; calls would 404
+#   gemini-3-flash-preview                   - superseded by the stable gemini-3.7-flash
+#   gemini-3.5-flash                         - $1.50/$9.00 per 1M vs 3.7 Flash's
+#                                              $0.75/$3.75 for lower quality
 MODELS = {
-    "Gemini 2.5 Flash (Fast)":       "gemini-2.5-flash",
-    "Gemini 2.5 Flash Lite (Cheap)": "gemini-2.5-flash-lite",
-    "Gemini 2.5 Pro (Best)":         "gemini-2.5-pro",
-    "Gemini 3.0 Flash":              "gemini-3-flash-preview",
-    "Gemini 3.5 Flash":              "gemini-3.5-flash",
-    "Gemini 2.0 Flash":              "gemini-2.0-flash-lite",
-    "Gemini 1.5 Flash":              "gemini-1.5-flash",
+    "Gemini 3.1 Pro (Max quality, preview)": "gemini-3.1-pro-preview",
+    "Gemini 3.7 Flash (Best all-round)":     "gemini-3.7-flash",
+    "Gemini 2.5 Pro (Stable, high quality)": "gemini-2.5-pro",
+    "Gemini 2.5 Flash (Fast)":               "gemini-2.5-flash",
+    "Gemini 3.5 Flash Lite (Cheap)":         "gemini-3.5-flash-lite",
+    "Gemini 2.5 Flash Lite (Cheapest)":      "gemini-2.5-flash-lite",
 }
 
-# Approximate pricing per 1M tokens (USD), under 200K-token context. Verified May 2026.
+# Max-quality defaults: every stage that shapes note content runs on a top-tier model.
+# At roughly $0.50 per meeting there is nothing here worth trading quality for.
+DEFAULT_TRANSCRIPTION_MODEL = "Gemini 3.7 Flash (Best all-round)"
+DEFAULT_REFINE_MODEL        = "Gemini 3.7 Flash (Best all-round)"
+DEFAULT_NOTES_MODEL         = "Gemini 3.1 Pro (Max quality, preview)"
+DEFAULT_INTEL_MODEL         = "Gemini 3.7 Flash (Best all-round)"
+DEFAULT_SUMMARY_MODEL       = "Gemini 3.1 Pro (Max quality, preview)"
+DEFAULT_ANALYSIS_MODEL      = "Gemini 3.1 Pro (Max quality, preview)"
+
+
+def default_model_index(display_name: str) -> int:
+    """Selectbox index for a default, looked up by name so reordering MODELS is safe."""
+    keys = list(MODELS.keys())
+    return keys.index(display_name) if display_name in keys else 0
+
+
+# Approximate pricing per 1M tokens (USD), under 200K-token context. Verified Aug 2026.
 # Tuple = (input_price, output_price). Used only by the in-app cost panel; for
 # authoritative billing see your Google Cloud project's billing reports. Audio input
 # tokens are billed at the text-input rate in this table — a small underestimate for
 # audio-heavy workflows, flagged in the cost-panel caption.
 MODEL_PRICING = {
-    "gemini-2.5-pro":         (1.25, 10.00),
-    "gemini-2.5-flash":       (0.30,  2.50),
-    "gemini-2.5-flash-lite":  (0.10,  0.40),
-    "gemini-3.5-flash":       (0.50,  3.00),  # estimate — exact pricing TBD
-    "gemini-3-flash-preview": (0.50,  3.00),
-    "gemini-3.1-flash-lite":  (0.25,  1.50),
     "gemini-3.1-pro-preview": (2.00, 12.00),
-    "gemini-2.0-flash-lite":  (0.075, 0.30),
-    "gemini-1.5-flash":       (0.075, 0.30),
+    "gemini-3.7-flash":       (0.75,  3.75),  # promo rate to 31 Dec 2026, then 1.50/7.50
+    "gemini-2.5-pro":         (1.25, 10.00),
+    "gemini-2.5-flash":       (0.30,  2.50),  # audio input billed at 1.00
+    "gemini-3.5-flash-lite":  (0.30,  2.50),
+    "gemini-2.5-flash-lite":  (0.10,  0.40),  # audio input billed at 0.30
 }
 
 MEETING_TYPES = ["Expert Meeting", "Management Meeting", "Internal Discussion"]
@@ -70,6 +95,11 @@ PROMPTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_p
 
 
 # ── 2. NOTES PROMPTS ───────────────────────────────────────────────────────────
+# ONE canonical prompt per meeting type. There is deliberately no "concise" variant and
+# no verbosity setting: a note that omits a point is not a shorter note, it is a wrong
+# note. Length is controlled by the WRITING DISCIPLINE block below — tight prose, one
+# idea per bullet — never by dropping material. The three prompts differ only in
+# terminology and in the capture priorities specific to that kind of meeting.
 # Expert Meeting prompts are the original, proven, high-quality capture prompts.
 # Management Meeting and Internal Discussion prompts use the SAME Q&A structure as
 # Expert (because that format gives the highest-fidelity output), but with
@@ -78,8 +108,8 @@ PROMPTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_p
 # "the team", never "experts". The Pro difference still comes from the intelligence
 # extraction layer below.
 
-EXPERT_MEETING_DETAILED_PROMPT = """### **PRIMARY DIRECTIVE: MAXIMUM DETAIL & STRICT COMPLETENESS**
-Your goal is to produce the most thorough, granular notes possible. Remove conversational filler ("um," "you know," repetition) but **nothing substantive should be omitted.** Every factual claim, example, explanation, aside, and data point in the transcript must appear in your notes. When in doubt, INCLUDE it. Err heavily on the side of over-inclusion. Longer, more detailed notes are always preferred over concise ones.
+EXPERT_MEETING_PROMPT = """### **PRIMARY DIRECTIVE: COMPLETE CAPTURE, TIGHT WRITING**
+Two rules, and they are not in tension. **First: omit nothing.** Every factual claim, example, anecdote, explanation, aside, and data point in the transcript must appear in your notes. When in doubt, INCLUDE it — a missing point is a defect, and the reader has no way of knowing it is missing. **Second: write tightly.** Say each point in as few words as convey it fully. Brevity comes from disciplined phrasing, never from leaving material out. Strip conversational filler ("um," "you know," verbal stumbles) and tighten clumsy phrasing. Never remove substance: if a sentence carries a fact, a reason, an example, or a qualifier, it survives.
 
 ### **NOTES STRUCTURE**
 
@@ -90,7 +120,7 @@ Your goal is to produce the most thorough, granular notes possible. Remove conve
 - If no intro exists, OMIT this section entirely.
 
 **(2.) Q&A format:**
-Structure the main body STRICTLY in Question/Answer format.
+Structure the main body STRICTLY in Question/Answer format. If the transcript has no interviewer - a voice note, a dictated memo, or an uninterrupted expert monologue - do not invent questions that were never asked. Instead, turn each distinct topic the speaker covers into a bold heading stating what that passage is about, and capture the substance as the bullets beneath it. The structure is identical; only the source of the headings changes.
 
 **(2.A) Questions:**
 -   Identify the core question being asked and rephrase it clearly in **bold**. Do NOT copy the question verbatim from the transcript — clean up filler, false starts, and rambling phrasing into a clear, well-formed question that preserves the original intent.
@@ -104,44 +134,18 @@ Structure the main body STRICTLY in Question/Answer format.
 -   Each bullet point must convey specific factual information in a clear, complete sentence.
 -   Use **multiple bullet points** per answer — do NOT collapse a detailed response into a single bullet.
 -   **ZERO SKIPPING RULE:** If the expert said it with substance, it must appear in your notes. Do NOT skip examples, anecdotes, specific sentences, or supporting details even if they seem minor or repetitive. Every distinct point gets its own bullet. If an answer contains 8 substantive points, you must produce at least 8 bullets — never condense them into 3-4.
--   **PRIORITY #1: CAPTURE ALL HARD DATA.** This includes all names, examples, monetary values (`$`), percentages (`%`), metrics, specific entities mentioned, time periods, market sizes, growth rates, company names, product names, and geographies.
+-   **PRIORITY #1: CAPTURE ALL HARD DATA.** This includes all names, examples, monetary values (`$`, `₹`, including crore and lakh figures), percentages (`%`), metrics, specific entities mentioned, time periods, market sizes, growth rates, company names, product names, and geographies. Reproduce figures in the unit the speaker used - never convert, never round.
 -   **PRIORITY #2: CAPTURE ALL NUANCE & REASONING.** Do not over-summarize or reduce complex answers to surface-level statements. You must retain the following:
     -   **Sentiment & Tone:** Note if the expert is confident, uncertain, speculative, cautious, or enthusiastic (e.g., "The expert was highly confident that...," "He cautioned that...").
     -   **Qualifiers & Conditions:** Preserve modifying words that change meaning (e.g., "usually," "in most cases," "except in," "only when," "roughly," "approximately," "a potential risk is...").
     -   **Key Examples & Analogies:** If the expert uses a specific example, anecdote, case study, or analogy to illustrate a point, capture it in full, even if it spans multiple sentences — these are often the most valuable parts of an expert call.
     -   **Cause & Effect:** Retain any reasoning chains provided (e.g., "...because of regulatory changes," "...which led to a 15% decline in...").
     -   **Comparisons & Contrasts:** If the expert compares companies, products, approaches, or time periods, capture both sides of the comparison with the specific details for each.
-    -   **Tangential but relevant points:** If the expert volunteers additional context, background, or related information beyond the direct question, include it — do NOT discard it as off-topic.
+    -   **Tangents, digressions and anecdotes:** If the expert volunteers context, background, a war story, or related information beyond the question asked, capture it in full. Material that reads as a digression is frequently the most valuable content in the call — it is what the expert knows that nobody thought to ask about. You are not qualified to judge it off-topic. Never drop it, never compress it to a mention.
 -   **PRIORITY #3: PRESERVE MULTI-STEP EXPLANATIONS.** If an answer involves a sequence of steps, a timeline, or a logical chain, preserve the full sequence rather than summarizing the conclusion only."""
 
-EXPERT_MEETING_CONCISE_PROMPT = """### **PRIMARY DIRECTIVE: EFFICIENT & NUANCED**
-Your goal is to be **efficient**, not just brief. Efficiency means removing conversational filler ("um," "you know," repetition) but **preserving all substantive information**. Your output should be concise yet information-dense.
-
-### **NOTES STRUCTURE**
-
-**(1.) Opening overview or Expert background (Conditional):**
-- If the transcript chunk begins with an overview, agenda, or expert intro, include it FIRST as bullet points.
-- **DO:** Capture ALL details (names, dates, numbers, titles).
-- **DO NOT:** Summarize.
-- If no intro exists, OMIT this section entirely.
-
-**(2.) Q&A format:**
-Structure the main body in Question/Answer format.
-
-**(2.A) Questions:**
--   Identify the core question being asked and rephrase it clearly in **bold**. Do NOT copy verbatim from the transcript — clean up filler and rambling into a clear, well-formed question.
--   **NO LABELS:** Do NOT prefix questions with "Q:", "Q.", "Question:", or any similar label.
--   **LONG QUESTIONS / PREAMBLE:** Preserve substantive framing as part of the bold question text.
--   **SPACING:** Leave exactly one blank line between the end of one answer and the start of the next bold question.
-
-**(2.B) Answers:**
--   Use bullet points (`-`) directly below the question.
--   Each bullet must convey specific factual information in a clear, complete sentence.
--   **PRIORITY #1: CAPTURE ALL HARD DATA.** Numbers, percentages, company names, metrics, specific entities.
--   **PRIORITY #2: CAPTURE ALL NUANCE.** Sentiment, qualifiers, key examples, cause & effect chains."""
-
-MANAGEMENT_MEETING_DETAILED_PROMPT = """### **PRIMARY DIRECTIVE: MAXIMUM DETAIL & STRICT COMPLETENESS**
-Your goal is to produce the most thorough, granular notes possible from a **management meeting** (e.g. an analyst's call with company management, an investor meeting, or a one-on-one with an executive). Remove conversational filler ("um," "you know," repetition) but **nothing substantive should be omitted.** Every factual claim, example, explanation, aside, and data point in the transcript must appear in your notes. When in doubt, INCLUDE it. Err heavily on the side of over-inclusion. Longer, more detailed notes are always preferred over concise ones.
+MANAGEMENT_MEETING_PROMPT = """### **PRIMARY DIRECTIVE: COMPLETE CAPTURE, TIGHT WRITING**
+You are taking notes on a **management meeting** (an analyst's call with company management, an investor meeting, or a one-on-one with an executive). Two rules, and they are not in tension. **First: omit nothing.** Every factual claim, example, anecdote, explanation, aside, and data point in the transcript must appear in your notes. When in doubt, INCLUDE it — a missing point is a defect, and the reader has no way of knowing it is missing. **Second: write tightly.** Say each point in as few words as convey it fully. Brevity comes from disciplined phrasing, never from leaving material out. Strip conversational filler ("um," "you know," verbal stumbles) and tighten clumsy phrasing. Never remove substance: if a sentence carries a fact, a reason, an example, or a qualifier, it survives.
 
 ### **TERMINOLOGY — DO NOT MISLABEL THE SPEAKERS**
 This is a **management meeting**, NOT an expert consultation. Refer to the company-side speakers as **"management"**, or by their specific role/name where known ("the CEO", "the CFO", "the Head of Strategy"). **NEVER refer to management as "the expert" or "the experts."** If specific names or roles are provided in the speaker context, use those. If the analyst side asks questions, refer to them as "the analyst" where needed.
@@ -177,42 +181,12 @@ Structure the main body STRICTLY in Question/Answer format. Most analyst-managem
     -   **Key Examples & Anecdotes:** If management uses a specific example, customer win, deal reference, plant/store-level anecdote, or case study to illustrate a point, capture it in full — these are often the highest-signal parts of a management call.
     -   **Cause & Effect:** Retain any reasoning chains provided (e.g., "...because input costs eased," "...which drove the 80bps margin expansion").
     -   **Comparisons & Contrasts:** If management compares segments, geographies, time periods, competitors, or business lines, capture both sides with the specific details for each.
-    -   **Tangential but relevant points:** If management volunteers additional context, background, or related information beyond the direct question, include it — do NOT discard it as off-topic.
+    -   **Tangents, digressions and anecdotes:** If management volunteers context, background, a plant or customer story, or related information beyond the question asked, capture it in full. Material that reads as a digression is frequently the most valuable content on the call — it is what management chose to volunteer. You are not qualified to judge it off-topic. Never drop it, never compress it to a mention.
 -   **PRIORITY #3: PRESERVE MULTI-STEP EXPLANATIONS.** If an answer involves a sequence of steps, a timeline, a capital allocation plan, or a logical chain, preserve the full sequence rather than summarizing the conclusion only.
 -   **PRIORITY #4: PRESERVE COMMITMENTS, TARGETS, AND DECISIONS INLINE.** When management announces a target, deadline, capex commitment, or strategic decision, capture it within the relevant Q&A bullet — do NOT strip these into a separate "decisions" or "action items" section. They belong with the context in which management discussed them."""
 
-MANAGEMENT_MEETING_CONCISE_PROMPT = """### **PRIMARY DIRECTIVE: EFFICIENT & NUANCED**
-Your goal is to be **efficient**, not just brief, when capturing a **management meeting** (analyst-management call, investor meeting, one-on-one with an executive). Remove conversational filler ("um," "you know," repetition) but **preserve all substantive information**. Your output should be concise yet information-dense.
-
-### **TERMINOLOGY — DO NOT MISLABEL THE SPEAKERS**
-This is a **management meeting**, NOT an expert consultation. Refer to the company-side speakers as **"management"**, or by their specific role/name where known ("the CEO", "the CFO", "the Head of Strategy"). **NEVER refer to management as "the expert" or "experts".** If the analyst side asks questions, refer to them as "the analyst" where needed.
-
-### **NOTES STRUCTURE**
-
-**(1.) Opening overview or Management background (Conditional):**
-- If the transcript chunk begins with an overview, agenda, or management introductions, include it FIRST as bullet points.
-- **DO:** Capture ALL details (names, titles, roles, segments owned).
-- **DO NOT:** Summarize.
-- If no intro exists, OMIT this section entirely.
-
-**(2.) Q&A format:**
-Structure the main body in Question/Answer format. If the transcript is monologue-style (prepared management commentary, opening remarks), convert each distinct topic management addresses into a bold question with the substance as bulleted answers below.
-
-**(2.A) Questions:**
--   Identify the core question and rephrase it clearly in **bold**. Do NOT copy verbatim — clean up filler and rambling into a clear, well-formed question.
--   **NO LABELS:** Do NOT prefix questions with "Q:", "Q.", "Question:", or similar.
--   **PREAMBLE:** Preserve substantive analyst framing as part of the bold question text.
--   **SPACING:** One blank line between the end of one answer and the next bold question.
-
-**(2.B) Answers (management's response):**
--   Use bullet points (`-`) directly below the question.
--   Each bullet must convey specific factual information in a clear, complete sentence.
--   **PRIORITY #1: CAPTURE ALL HARD DATA.** Numbers, percentages, monetary figures, growth rates, capex, capacity, market shares, guidance, targets, named segments, brands, geographies, time periods.
--   **PRIORITY #2: CAPTURE ALL NUANCE.** Sentiment (confident, cautious, hedging, defensive), qualifiers ("we expect", "we are targeting", "subject to"), key examples and anecdotes, cause & effect chains, comparisons across segments/geographies/competitors.
--   **PRIORITY #3: PRESERVE COMMITMENTS INLINE.** Targets, deadlines, capex commitments, strategic decisions — capture within the relevant Q&A bullet; do NOT strip into a separate section."""
-
-INTERNAL_DISCUSSION_DETAILED_PROMPT = """### **PRIMARY DIRECTIVE: MAXIMUM DETAIL & STRICT COMPLETENESS**
-Your goal is to produce the most thorough, granular notes possible from an **internal team discussion** (e.g. a research-team debate, an investment committee discussion, a strategy meeting among colleagues). Remove conversational filler ("um," "you know," repetition) but **nothing substantive should be omitted.** Every factual claim, example, position, counter-argument, and data point in the transcript must appear in your notes. When in doubt, INCLUDE it. Longer, more detailed notes are always preferred over concise ones.
+INTERNAL_DISCUSSION_PROMPT = """### **PRIMARY DIRECTIVE: COMPLETE CAPTURE, TIGHT WRITING**
+You are taking notes on an **internal team discussion** (a research-team debate, an investment committee discussion, a strategy meeting among colleagues). Two rules, and they are not in tension. **First: omit nothing.** Every factual claim, example, position, counter-argument, and data point in the transcript must appear in your notes. When in doubt, INCLUDE it — a missing point is a defect, and the reader has no way of knowing it is missing. **Second: write tightly.** Say each point in as few words as convey it fully. Brevity comes from disciplined phrasing, never from leaving material out. Strip conversational filler ("um," "you know," verbal stumbles) and tighten clumsy phrasing. Never remove substance: if a sentence carries a fact, a reason, an example, or a qualifier, it survives.
 
 ### **TERMINOLOGY — DO NOT MISLABEL THE SPEAKERS**
 This is an **internal discussion among colleagues**, NOT an expert consultation. Refer to participants as **"the speaker(s)"**, **"the team"**, or by name where named in the transcript or speaker context. **NEVER refer to participants as "experts" or "the expert".** Where the transcript attributes views to specific people, preserve that attribution (e.g., "X argued that...", "Y countered with...").
@@ -240,7 +214,7 @@ Structure the main body STRICTLY in Question/Answer format. An internal discussi
 -   Each bullet point must convey a specific position, argument, piece of evidence, or data point in a clear, complete sentence.
 -   **ATTRIBUTION:** Where the transcript attributes a view to a specific person, preserve it in the bullet ("X argued that...", "Y countered..."). Where views are shared or unattributed, state them without forcing attribution.
 -   **ZERO SKIPPING RULE:** Every distinct point, argument, counter-argument, and piece of evidence raised must appear as its own bullet. Do NOT condense multiple positions into one bullet. If the discussion contains 8 substantive points, you must produce at least 8 bullets.
--   **PRIORITY #1: CAPTURE ALL HARD DATA.** Numbers, percentages, dates, named companies, named products/people/geographies, prior decisions or positions referenced, external data sources cited.
+-   **PRIORITY #1: CAPTURE ALL HARD DATA.** Numbers, monetary values (`$`, `₹`, including crore and lakh figures), percentages, dates, named companies, named products/people/geographies, prior decisions or positions referenced, external data sources cited. Reproduce figures in the unit the speaker used - never convert, never round.
 -   **PRIORITY #2: CAPTURE ALL POSITIONS, REASONING, AND DISAGREEMENT.** Do not over-summarize. Retain:
     -   **All sides:** Capture every distinct view raised, including dissenting and minority views. Do NOT favour the dominant view or strip out the dissent.
     -   **Reasoning chains:** Preserve the "why" behind each position (e.g., "...because the comparable in 2019 was different," "...assuming the new capacity comes online by Q2").
@@ -248,39 +222,9 @@ Structure the main body STRICTLY in Question/Answer format. An internal discussi
     -   **Sentiment & confidence:** Note where the speaker was confident, uncertain, hedging, or changing their view mid-discussion ("X was initially sceptical but came around when...").
     -   **Agreement vs disagreement:** Make these explicit within the bullets ("the team agreed that...", "X and Y disagreed on...").
     -   **Caveats and risks raised:** Preserve in the speaker's own framing.
+    -   **Tangents, digressions and anecdotes:** If a participant volunteers context, background, a prior experience, or related information beyond the issue at hand, capture it in full. Material that reads as a digression is frequently the most valuable thing said. You are not qualified to judge it off-topic. Never drop it, never compress it to a mention.
 -   **PRIORITY #3: PRESERVE MULTI-STEP REASONING.** If a participant builds an argument step-by-step, preserve the full chain rather than the conclusion only.
 -   **PRIORITY #4: PRESERVE CONCLUSIONS AND OPEN ITEMS INLINE.** If the discussion reaches a conclusion or leaves something open, capture it within the relevant Q&A bullet — do NOT strip these into a separate "next steps" or "conclusions" section. They belong with the discussion that produced them."""
-
-INTERNAL_DISCUSSION_CONCISE_PROMPT = """### **PRIMARY DIRECTIVE: EFFICIENT & NUANCED**
-Your goal is to be **efficient**, not just brief, when capturing an **internal team discussion** (research-team debate, investment committee, strategy meeting among colleagues). Remove conversational filler ("um," "you know," repetition) but **preserve all substantive information**. Your output should be concise yet information-dense.
-
-### **TERMINOLOGY — DO NOT MISLABEL THE SPEAKERS**
-This is an **internal discussion among colleagues**, NOT an expert consultation. Refer to participants as **"the speaker(s)"**, **"the team"**, or by name where named in the transcript or speaker context. **NEVER refer to participants as "experts" or "the expert".** Preserve attribution where the transcript provides it ("X argued that...", "Y countered...").
-
-### **NOTES STRUCTURE**
-
-**(1.) Opening overview or Discussion context (Conditional):**
-- If the transcript chunk begins with an overview or context-setting, include it FIRST as bullet points.
-- **DO:** Capture stated purpose, the question being discussed, participants.
-- **DO NOT:** Summarize.
-- If no intro exists, OMIT this section entirely.
-
-**(2.) Q&A format (adapted for discussion):**
-Structure the main body in Question/Answer format. **Treat each distinct issue, question, or topic raised in the discussion as a bold "question"**, and capture the discussion that followed as the bulleted "answer".
-
-**(2.A) Questions (issues / topics raised):**
--   Identify each distinct issue and rephrase it clearly in **bold**. Examples: *"Whether to add to the position given the Q3 miss"*, *"How to interpret the channel-check feedback on pricing"*.
--   **NO LABELS:** Do NOT prefix with "Q:", "Topic:", "Issue:", or similar.
--   **PREAMBLE:** Preserve substantive framing as part of the bold statement.
--   **SPACING:** One blank line between the end of one discussion and the next bold issue.
-
-**(2.B) Answers (the discussion that followed):**
--   Use bullet points (`-`) directly below the bold issue.
--   Each bullet must convey a specific position, argument, or data point.
--   **ATTRIBUTION:** Preserve where the transcript provides it ("X argued...", "Y countered...").
--   **PRIORITY #1: CAPTURE ALL HARD DATA.** Numbers, percentages, named companies, products, geographies, dates, prior decisions or references invoked.
--   **PRIORITY #2: CAPTURE ALL POSITIONS AND REASONING.** All sides including minority views; the "why" behind each position; evidence cited; sentiment / confidence; agreement vs disagreement made explicit.
--   **PRIORITY #3: PRESERVE CONCLUSIONS INLINE.** Capture within the relevant Q&A bullet; do NOT strip into a separate "next steps" or "conclusions" section."""
 
 PROMPT_INITIAL = """You are a High-Fidelity Factual Extraction Engine. Your task is to analyze a meeting transcript chunk and generate detailed, factual notes.
 Your primary directive is **100% completeness and accuracy**. Process the transcript sequentially and generate notes following the structure below.
@@ -303,7 +247,7 @@ Below is a summary of the notes generated from the previous transcript chunk. Us
 3.  **MAINTAIN FORMAT:** Continue to use the exact same formatting as established in the base instructions.
 4.  **NO META-COMMENTARY:** NEVER produce statements about the transcript itself, such as "the transcript does not contain an answer," "no relevant information in this section," etc. Always extract and document whatever substantive content exists.
 5.  **MID-CHUNK STARTS:** If the chunk starts in the middle of a response, begin your notes by capturing that content under the most relevant heading from context. Do not skip or discard partial content.
-6.  **MAINTAIN OUTPUT VOLUME:** This chunk contains the same amount of content as the first chunk. Your output for this chunk MUST be equally detailed and equally long. Do NOT taper off, summarize, or become briefer.
+6.  **DO NOT TAPER OFF:** Later chunks are routinely under-processed - the model tires, starts summarising, and the back half of a long call ends up thinner than the front. Apply exactly the same capture standard here as on chunk one: every point, every example, every anecdote, at the same granularity. This is a completeness standard, not a length quota - do not pad to match a word count, and do not skimp because you have already written a lot.
 
 ---
 {base_instructions}
@@ -738,11 +682,53 @@ def write_saved_prompts(data: dict):
 
 # ── 6. CORE UTILITIES ──────────────────────────────────────────────────────────
 
-def get_model(display_name: str) -> genai.GenerativeModel:
+class _StreamHandle:
+    """Iterable wrapper around a google-genai streaming response.
+
+    The raw stream is a generator, so the usage-tracking attributes that
+    generate_with_retry attaches cannot be set on it directly the way the old SDK
+    allowed. This holds them, and captures usage_metadata as chunks go past so
+    stream_and_collect can record cost once iteration finishes."""
+
+    def __init__(self, stream, model_id: str, stage: str = ""):
+        self._stream = stream
+        self._tracked_model_id = model_id
+        self._tracked_stage = stage
+        self.usage_metadata = None
+
+    def __iter__(self):
+        for chunk in self._stream:
+            usage = getattr(chunk, "usage_metadata", None)
+            if usage is not None:
+                self.usage_metadata = usage
+            yield chunk
+
+
+class _ModelHandle:
+    """Adapter exposing the old `.generate_content(...)` signature on top of
+    google-genai, so all existing call sites keep working unchanged."""
+
+    def __init__(self, model_id: str):
+        self.model_name = model_id
+
+    def generate_content(self, prompt, stream: bool = False, generation_config=None):
+        if _client is None:
+            raise RuntimeError("GEMINI_API_KEY is not set - cannot call the Gemini API.")
+        contents = prompt if isinstance(prompt, list) else [prompt]
+        config = types.GenerateContentConfig(**generation_config) if generation_config else None
+        if stream:
+            raw = _client.models.generate_content_stream(
+                model=self.model_name, contents=contents, config=config)
+            return _StreamHandle(raw, self.model_name)
+        return _client.models.generate_content(
+            model=self.model_name, contents=contents, config=config)
+
+
+def get_model(display_name: str) -> "_ModelHandle":
     cache = st.session_state.setdefault("_model_cache", {})
-    model_id = MODELS.get(display_name, "gemini-2.5-flash")
+    model_id = MODELS.get(display_name, "gemini-3.7-flash")
     if model_id not in cache:
-        cache[model_id] = genai.GenerativeModel(model_id)
+        cache[model_id] = _ModelHandle(model_id)
     return cache[model_id]
 
 
@@ -820,8 +806,9 @@ def generate_with_retry(model, prompt, max_retries: int = 3, stream: bool = Fals
 def stream_and_collect(response, placeholder=None) -> Tuple[str, int]:
     full_text, counter = "", 0
     for chunk in response:
-        if chunk.parts:
-            full_text += chunk.text
+        piece = getattr(chunk, "text", None)
+        if piece:
+            full_text += piece
             counter += 1
             if placeholder and counter % 5 == 0:
                 placeholder.caption(f"Streaming… {len(full_text.split()):,} words")
@@ -911,98 +898,228 @@ def extract_pdf_text(file_bytes: bytes) -> str:
 
 # ── 7. AUDIO TRANSCRIPTION ─────────────────────────────────────────────────────
 
-def transcribe_audio(audio_bytes: bytes, model, status_write, context: str = "", file_ext: str = ".audio") -> str:
-    transcription_instruction = "Transcribe this audio accurately, preserving the speaker's words as closely as possible."
-    if context.strip():
-        transcription_instruction += (
-            f"\n\nContext to help with accurate transcription "
-            f"(use this to correctly identify domain-specific terms, names, and abbreviations):\n{context.strip()}"
+def _audio_duration_seconds(path: str) -> float:
+    """Duration in seconds via ffprobe. Returns 0.0 if ffprobe is missing or fails,
+    which callers treat as "unknown" and fall back to single-shot transcription."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, timeout=60, text=True,
         )
+        return float(out.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def _segment_audio(input_path: str, duration: float) -> List[str]:
+    """Cut the audio into OVERLAPPING windows, returning segment paths in order.
+
+    Each window is AUDIO_SEGMENT_SECONDS long and advances by
+    (AUDIO_SEGMENT_SECONDS - AUDIO_OVERLAP_SECONDS), so neighbours share the overlap
+    and no speech falls into a gap. Returns [] when segmentation is not possible, so
+    the caller can fall back to sending the whole file in one piece."""
+    step = AUDIO_SEGMENT_SECONDS - AUDIO_OVERLAP_SECONDS
+    starts, t = [], 0.0
+    while t < duration:
+        starts.append(t)
+        t += step
+    segments = []
+    for i, start in enumerate(starts):
+        seg_path = "%s_seg_%03d.wav" % (input_path, i)
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-ss", str(start), "-t", str(AUDIO_SEGMENT_SECONDS),
+                 "-i", input_path, "-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1", seg_path],
+                capture_output=True, timeout=300,
+            )
+        except Exception:
+            return []
+        if os.path.exists(seg_path) and os.path.getsize(seg_path) > 1024:
+            segments.append(seg_path)
+    return segments
+
+
+def transcribe_audio(audio_bytes: bytes, model, status_write, context: str = "", file_ext: str = ".audio") -> str:
+    base_instruction = (
+        "Transcribe this audio completely and accurately, preserving the speaker's words "
+        "as closely as possible. Transcribe EVERY sentence spoken - do not summarise, do "
+        "not skip passages, and do not stop early. Where speakers are distinguishable, "
+        "label them (Speaker 1, Speaker 2, or by name where the audio makes it clear). "
+        "Output only the transcript itself: no preamble, no commentary, no notes about "
+        "the recording."
+    )
+    if context.strip():
+        base_instruction += (
+            "\n\nContext to help with accurate transcription (use this to correctly "
+            "identify domain-specific terms, names, and abbreviations):\n" + context.strip()
+        )
+
     local_paths, cloud_names, transcripts = [], [], []
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as f:
         f.write(audio_bytes)
         input_path = f.name
     local_paths.append(input_path)
-    try:
-        chunk_pattern = input_path + "_chunk_%03d.wav"
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", input_path,
-             "-f", "segment", "-segment_time", "300",
-             "-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1", chunk_pattern],
-            capture_output=True, timeout=300,
+
+    def _upload_and_transcribe(path: str, instruction: str) -> str:
+        cloud = _client.files.upload(file=path)
+        cloud_names.append(cloud.name)
+        while cloud.state.name == "PROCESSING":
+            time.sleep(2)
+            cloud = _client.files.get(name=cloud.name)
+        if cloud.state.name != "ACTIVE":
+            raise RuntimeError("Audio failed to process in the cloud: %s" % cloud.state.name)
+        resp = generate_with_retry(
+            model, [instruction, cloud], stage="Transcription",
+            generation_config={"max_output_tokens": MAX_OUTPUT_TOKENS},
         )
-        chunk_files = sorted(glob.glob(input_path + "_chunk_*.wav"))
-        local_paths.extend(chunk_files)
-        if not chunk_files:
-            converted_path = input_path + "_full.wav"
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", input_path,
-                 "-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1", converted_path],
-                capture_output=True, timeout=120,
-            )
-            local_paths.append(converted_path)
-            chunk_files = [converted_path]
-        for i, chunk_path in enumerate(chunk_files):
-            status_write(f"Transcribing audio chunk {i+1} of {len(chunk_files)}…")
-            cloud = genai.upload_file(path=chunk_path)
-            cloud_names.append(cloud.name)
-            while cloud.state.name == "PROCESSING":
-                time.sleep(2)
-                cloud = genai.get_file(cloud.name)
-            if cloud.state.name != "ACTIVE":
-                raise RuntimeError(f"Audio chunk {i+1} failed to process in the cloud.")
-            resp = generate_with_retry(model, [transcription_instruction, cloud], stage="Transcription")
-            transcripts.append(resp.text)
+        return resp.text or ""
+
+    try:
+        duration = _audio_duration_seconds(input_path)
+        segments = _segment_audio(input_path, duration) if duration > AUDIO_SEGMENT_SECONDS else []
+        local_paths.extend(segments)
+
+        # Short clip, or ffmpeg/ffprobe unavailable - send the file as a single piece.
+        if not segments:
+            status_write("Transcribing audio...")
+            return _upload_and_transcribe(input_path, base_instruction).strip()
+
+        for i, seg_path in enumerate(segments):
+            status_write("Transcribing audio segment %d of %d..." % (i + 1, len(segments)))
+            if i == 0:
+                instruction = base_instruction
+            else:
+                # Give the model the tail of what we already have and tell it where the
+                # overlap ends, so the seam is stitched by the model rather than by a
+                # blind text-level dedup - the latter is what drops content.
+                tail = " ".join(transcripts[-1].split()[-150:])
+                instruction = (
+                    base_instruction
+                    + "\n\nCONTINUATION: this is part %d of %d of one longer recording. "
+                      "Its first ~%d seconds deliberately overlap the end of the previous "
+                      "segment, which was transcribed as:\n---\n..."
+                      % (i + 1, len(segments), AUDIO_OVERLAP_SECONDS)
+                    + tail
+                    + "\n---\nBegin your transcript at the point where that text ends. Do not "
+                      "repeat the overlapping words, and do not omit anything spoken after "
+                      "them. If the segment opens mid-sentence, start from the first word "
+                      "that is not already present in the text above."
+                )
+            transcripts.append(_upload_and_transcribe(seg_path, instruction))
     finally:
-        for p in local_paths:
-            try: os.remove(p)
-            except Exception: pass
-        for n in cloud_names:
-            try: genai.delete_file(n)
-            except Exception: pass
-    return "\n\n".join(transcripts).strip()
+        for path in local_paths:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+        for name in cloud_names:
+            try:
+                _client.files.delete(name=name)
+            except Exception:
+                pass
+    return "\n\n".join(t for t in transcripts if t).strip()
 
 
 # ── 8. TRANSCRIPT REFINEMENT ───────────────────────────────────────────────────
+
+# Refinement rewrites the entire transcript, which makes it the easiest place in the
+# pipeline to silently lose content: a model handed a long passage and a vague "clean
+# this up" instruction will tighten and compress it. Anything dropped here is invisible
+# downstream, because the notes stage never sees the original. Hence this rule.
+REFINEMENT_FIDELITY_RULE = (
+    "SCOPE - THIS IS A LANGUAGE-CORRECTION TASK, NOT A SUMMARISATION TASK.\n"
+    "You may ONLY: correct spelling, grammar and punctuation; label speakers; translate "
+    "non-English speech into English; and delete pure verbal noise ('um', 'uh', stutters, "
+    "false starts, and word-level repetition such as 'I think, I think').\n"
+    "Everything that carries information must survive: every claim, number, name, date, "
+    "example, anecdote, aside, digression, caveat, hedge and qualifier. Where a speaker "
+    "makes the same point more than once, keep it each time - a repeated point is signal, "
+    "not noise. Deleting a stutter is fine; deleting a restated argument is not.\n"
+    "Do not condense. Do not merge two statements into one. Do not replace a specific "
+    "statement with a general one. Do not summarise an example instead of reproducing it. "
+    "Do not tidy a rambling answer by shortening it - fix its grammar and leave its "
+    "content intact.\n"
+    "Removing verbal noise should shorten the text only slightly. A materially shorter "
+    "output means information was dropped, which is a failure of the task.\n"
+    "Output only the refined transcript - no preamble, no commentary, no summary."
+)
+
+# Below this refined:raw word ratio, refinement has probably dropped content rather than
+# merely stripped disfluencies. Set at 0.80 rather than tighter because clearing "um",
+# false starts and stutters out of a raw ASR transcript legitimately costs 10-15%.
+REFINEMENT_SHRINK_THRESHOLD = 0.80
+
+
+def _check_refinement_shrink(raw: str, refined: str) -> str:
+    """Warn loudly when refinement returns materially less text than it was given.
+
+    A shrunken transcript is the signature of dropped content, and it is otherwise
+    undetectable - the notes still look plausible, they are just missing things. The
+    refined text is still returned; the user decides whether to re-run, switch model,
+    or turn refinement off."""
+    raw_words, refined_words = len(raw.split()), len(refined.split())
+    if raw_words and refined_words / raw_words < REFINEMENT_SHRINK_THRESHOLD:
+        pct = (1 - refined_words / raw_words) * 100
+        st.warning(
+            "Refinement shrank the transcript by %.0f%% (%s to %s words). Stripping filler "
+            "costs 10-15%%; beyond that, content was probably dropped. Compare the two "
+            "transcripts before trusting these notes - or re-run with refinement off."
+            % (pct, format(raw_words, ","), format(refined_words, ","))
+        )
+    return refined
+
 
 def refine_transcript(raw: str, meeting_type: str, speakers: str, model, status_write) -> str:
     lang_instr = (
         "IMPORTANT: Your entire output MUST be in English. "
         "If the transcript contains Hindi, Hinglish, or any other non-English language, "
-        "translate all content into clear, natural English while preserving the original meaning."
+        "translate all content into clear, natural English while preserving the original "
+        "meaning. Translate every sentence - never summarise while translating."
     )
     extra = REFINEMENT_INSTRUCTIONS.get(meeting_type, "")
-    speaker_info = f"Participants: {speakers}." if speakers.strip() else ""
+    speaker_info = "Participants: %s." % speakers if speakers.strip() else ""
     words = raw.split()
+
     if len(words) <= CHUNK_WORD_SIZE:
-        status_write("Refining transcript (single chunk)…")
+        status_write("Refining transcript (single chunk)...")
         prompt = (
-            f"Refine the following transcript. Correct spelling, grammar, and punctuation. "
-            f"Label speakers clearly if possible. {speaker_info} {extra}\n{lang_instr}\n\n"
-            f"TRANSCRIPT:\n{raw}"
+            "Refine the following transcript. Correct spelling, grammar, and punctuation. "
+            "Label speakers clearly if possible. %s %s\n%s\n\n%s\n\nTRANSCRIPT:\n%s"
+            % (speaker_info, extra, lang_instr, REFINEMENT_FIDELITY_RULE, raw)
         )
-        return generate_with_retry(model, prompt, stage="Refinement").text
+        refined = generate_with_retry(
+            model, prompt, stage="Refinement",
+            generation_config={"max_output_tokens": MAX_OUTPUT_TOKENS}).text
+        return _check_refinement_shrink(raw, refined)
+
     chunks = create_chunks_with_overlap(raw, CHUNK_WORD_SIZE, CHUNK_WORD_OVERLAP)
-    status_write(f"Refining transcript ({len(chunks)} chunks in parallel)…")
+    status_write("Refining transcript (%d chunks in parallel)..." % len(chunks))
     prompts = []
     for i, chunk in enumerate(chunks):
         if i == 0:
             prompts.append(
-                f"You are refining a transcript. Correct spelling, grammar, and punctuation. "
-                f"Label speakers clearly if possible. {speaker_info} {extra}\n{lang_instr}\n\n"
-                f"TRANSCRIPT CHUNK TO REFINE:\n{chunk}"
+                "You are refining a transcript. Correct spelling, grammar, and punctuation. "
+                "Label speakers clearly if possible. %s %s\n%s\n\n%s\n\n"
+                "TRANSCRIPT CHUNK TO REFINE:\n%s"
+                % (speaker_info, extra, lang_instr, REFINEMENT_FIDELITY_RULE, chunk)
             )
         else:
             ctx_tail = " ".join(chunks[i - 1].split()[-CHUNK_WORD_OVERLAP:])
             prompts.append(
-                f"You are continuing to refine a long transcript. "
-                f"Below is the tail of the previous section for context. {speaker_info} {extra}\n{lang_instr}\n"
-                f"---\nCONTEXT (previous chunk tail):\n...{ctx_tail}\n---\n"
-                f"NEW CHUNK TO REFINE:\n{chunk}"
+                "You are continuing to refine a long transcript. Below is the tail of the "
+                "previous section for context. %s %s\n%s\n\n%s\n\n"
+                "---\nCONTEXT (previous chunk tail - do NOT re-output this):\n...%s\n---\n"
+                "NEW CHUNK TO REFINE:\n%s"
+                % (speaker_info, extra, lang_instr, REFINEMENT_FIDELITY_RULE, ctx_tail, chunk)
             )
     results = [None] * len(chunks)
+
     def _refine_one(idx, prompt):
-        return idx, generate_with_retry(model, prompt, stage="Refinement").text
+        return idx, generate_with_retry(
+            model, prompt, stage="Refinement",
+            generation_config={"max_output_tokens": MAX_OUTPUT_TOKENS}).text
+
     with ThreadPoolExecutor(max_workers=min(3, len(chunks))) as executor:
         futures = {executor.submit(_refine_one, i, p): i for i, p in enumerate(prompts)}
         done = 0
@@ -1010,27 +1127,62 @@ def refine_transcript(raw: str, meeting_type: str, speakers: str, model, status_
             idx, text = future.result()
             results[idx] = text
             done += 1
-            status_write(f"Refinement: {done}/{len(chunks)} chunks done…")
-    return "\n\n".join(r for r in results if r)
+            status_write("Refinement: %d/%d chunks done..." % (done, len(chunks)))
+    refined = "\n\n".join(r for r in results if r)
+    return _check_refinement_shrink(raw, refined)
 
 
 # ── 9. NOTES GENERATION ────────────────────────────────────────────────────────
 
-def _build_base_prompt(meeting_type: str, detail_level: str, extra_context: str) -> str:
-    detailed = detail_level == "Detailed"
+# Appended to the CONCISE prompts only. The concise variants were written as trimmed
+# copies of the detailed ones and lost several anti-omission rules along the way; this
+# puts the floor back, while leaving the concise writing style intact.
+# Appended to every notes prompt. This block is the ONLY place length is managed. It
+# tightens how each point is written and never authorises dropping one — that division
+# is the whole point of retiring the concise/detailed switch.
+WRITING_DISCIPLINE = """### **WRITING DISCIPLINE**
+Coverage is settled by the rules above — everything said gets captured. This section
+governs only *how* each captured point is written.
+-   **One idea per bullet.** A bullet carrying two ideas should be two bullets. This makes
+    notes longer in line count and shorter in reading time, which is the right trade.
+-   **Lead with the substance.** Start each bullet with the point itself, not with
+    throat-clearing ("It was noted that...", "The discussion covered...", "They mentioned
+    that..."). Cut those openers and keep what follows.
+-   **Do not restate the question inside the answer.** The bold question above already
+    frames it; the bullets carry only what was said in response.
+-   **Keep specifics, cut padding.** Numbers, names, dates, qualifiers and examples always
+    stay. What goes is empty phrasing: filler adjectives, throat-clearing, and the same
+    sentence said twice over.
+-   **Repeated wording is padding; a repeated point is not.** If a speaker makes the same
+    argument at three different moments in the call, that belongs in your notes three
+    times, in the three places it was made. Never fold it into one bullet, and never drop
+    the later mentions as redundant — how often something is returned to is itself the
+    signal. Only identical phrasing within a single answer may be tightened.
+-   **No meta-commentary.** Never write about the transcript itself — no "the audio was
+    unclear here", no "this section was brief", no "no further detail was given". Capture
+    what was said and stop.
+-   **No closing summary.** Do not add a recap, key-takeaways, or conclusions section.
+    Every point belongs in the Q&A pair it came from.
+-   **Length is an output, not a target.** Never pad to seem thorough; never trim to seem
+    efficient. A well-written note is exactly as long as the material demands.
+"""
+
+
+def _build_base_prompt(meeting_type: str, extra_context: str) -> str:
     if meeting_type == "Expert Meeting":
-        base = EXPERT_MEETING_DETAILED_PROMPT if detailed else EXPERT_MEETING_CONCISE_PROMPT
+        base = EXPERT_MEETING_PROMPT
     elif meeting_type == "Management Meeting":
-        base = MANAGEMENT_MEETING_DETAILED_PROMPT if detailed else MANAGEMENT_MEETING_CONCISE_PROMPT
+        base = MANAGEMENT_MEETING_PROMPT
     else:
-        base = INTERNAL_DISCUSSION_DETAILED_PROMPT if detailed else INTERNAL_DISCUSSION_CONCISE_PROMPT
+        base = INTERNAL_DISCUSSION_PROMPT
+    base += "\n\n" + WRITING_DISCIPLINE
     if extra_context.strip():
         base += f"\n\n**ADDITIONAL CONTEXT PROVIDED:**\n{extra_context.strip()}"
     return base
 
 
-def generate_notes(transcript: str, meeting_type: str, detail_level: str, extra_context: str, model, status_write) -> str:
-    base = _build_base_prompt(meeting_type, detail_level, extra_context)
+def generate_notes(transcript: str, meeting_type: str, extra_context: str, model, status_write) -> str:
+    base = _build_base_prompt(meeting_type, extra_context)
     words = transcript.split()
     if len(words) <= CHUNK_WORD_SIZE:
         status_write("Generating notes (single chunk)…")
@@ -1424,19 +1576,19 @@ def page_process():
     with st.sidebar:
         st.markdown("### Model Settings")
         notes_model_name = st.selectbox(
-            "Notes model", list(MODELS.keys()), index=2,
+            "Notes model", list(MODELS.keys()), index=default_model_index(DEFAULT_NOTES_MODEL),
             key="notes_model", help="Main note generation. Use 2.5 Pro for highest quality."
         )
         refine_model_name = st.selectbox(
-            "Refinement model", list(MODELS.keys()), index=1,
+            "Refinement model", list(MODELS.keys()), index=default_model_index(DEFAULT_REFINE_MODEL),
             key="refine_model", help="Transcript clean-up pass."
         )
         transcription_model_name = st.selectbox(
-            "Transcription model", list(MODELS.keys()), index=3,
+            "Transcription model", list(MODELS.keys()), index=default_model_index(DEFAULT_TRANSCRIPTION_MODEL),
             key="transcription_model", help="Audio-to-text."
         )
         intel_model_name = st.selectbox(
-            "Intelligence model", list(MODELS.keys()), index=0,
+            "Intelligence model", list(MODELS.keys()), index=default_model_index(DEFAULT_INTEL_MODEL),
             key="intel_model", help="Intelligence extraction from notes. 2.5 Flash is fast and accurate for this task."
         )
         refine_enabled = st.toggle(
@@ -1445,13 +1597,6 @@ def page_process():
         )
 
     meeting_type = st.selectbox("Meeting type", MEETING_TYPES, key="meeting_type")
-
-    # Concise vs Detailed now available for ALL meeting types — each type has its own
-    # Concise and Detailed prompt variant. Default ("Concise") is the first option.
-    detail_level = st.radio(
-        "Note style", ["Concise", "Detailed"], horizontal=True, key="detail_level",
-        help="**Concise**: information-dense, no filler.  **Detailed**: maximum verbosity, zero omission."
-    )
 
     with st.expander("Context & additional instructions", expanded=False):
         st.caption(
@@ -1551,7 +1696,7 @@ def page_process():
                     transcript = refine_transcript(transcript, meeting_type, speakers, refine_model, st.write)
                     st.write(f"✓ Refinement complete: **{len(transcript.split()):,} words**")
 
-                notes = generate_notes(transcript, meeting_type, detail_level,
+                notes = generate_notes(transcript, meeting_type,
                                        extra_context_combined, notes_model, st.write)
                 if not notes or not notes.strip():
                     raise ValueError("The model returned empty notes. Please try again.")
@@ -1650,12 +1795,12 @@ def page_summary():
     with st.sidebar:
         st.markdown("### Model Settings")
         intel_model_name = st.selectbox(
-            "Intelligence model", list(MODELS.keys()), index=0,
+            "Intelligence model", list(MODELS.keys()), index=default_model_index(DEFAULT_INTEL_MODEL),
             key="summary_intel_model",
             help="Used to extract intelligence if pasting notes manually."
         )
         summary_model_name = st.selectbox(
-            "Summary model", list(MODELS.keys()), index=2,
+            "Summary model", list(MODELS.keys()), index=default_model_index(DEFAULT_SUMMARY_MODEL),
             key="summary_model",
             help="Used to generate the summary. 2.5 Pro gives the highest quality output."
         )
@@ -1927,7 +2072,7 @@ def page_analyse():
     with st.sidebar:
         st.markdown("### Model Settings")
         analysis_model_name = st.selectbox(
-            "Analysis model", list(MODELS.keys()), index=2,
+            "Analysis model", list(MODELS.keys()), index=default_model_index(DEFAULT_ANALYSIS_MODEL),
             key="analysis_model",
             help="2.5 Pro gives the most rigorous analytical reasoning."
         )
@@ -2130,11 +2275,11 @@ def page_transcribe():
     with st.sidebar:
         st.markdown("### Model Settings")
         transcription_model_name = st.selectbox(
-            "Transcription model", list(MODELS.keys()), index=3,
+            "Transcription model", list(MODELS.keys()), index=default_model_index(DEFAULT_TRANSCRIPTION_MODEL),
             key="t_transcription_model", help="Audio-to-text."
         )
         refine_model_name = st.selectbox(
-            "Refinement model", list(MODELS.keys()), index=1,
+            "Refinement model", list(MODELS.keys()), index=default_model_index(DEFAULT_REFINE_MODEL),
             key="t_refine_model", help="Transcript clean-up pass."
         )
         refine_enabled = st.toggle(
