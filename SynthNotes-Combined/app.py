@@ -1404,15 +1404,21 @@ def auto_download_files(files) -> None:
     components.html("<script>" + "\n".join(blocks) + "</script>", height=0)
 
 
-def deliver_stage_output(session_key: str, filename: str, content, mime: str) -> None:
+def deliver_stage_output(session_key: str, filename: str, content, mime: str,
+                        store_content=None) -> None:
     """Persist a finished stage's output and push it to the browser immediately.
 
     Called as each stage completes rather than at the end of the run. Every stage costs
     real money and is independently useful for resuming, so a later failure must never
-    discard work that already succeeded."""
+    discard work that already succeeded.
+
+    `store_content` exists because what gets downloaded is not always what should be
+    kept in session state: the final note downloads as chart-caption markdown, but the
+    canonical copy must stay the raw document with its chart blocks intact, or the
+    preview and the PDF lose their charts."""
     if not content:
         return
-    st.session_state[session_key] = content
+    st.session_state[session_key] = content if store_content is None else store_content
     auto_download_files([(filename, content, mime)])
     st.write(f"💾 Saved and downloaded: `{filename}`")
 
@@ -1774,12 +1780,12 @@ def main():
             with st.status("Stage 3 — Writing the final note…", expanded=True) as s:
                 final_doc = hierarchical_reduce(notes_list, filenames, user_prompt, target_word_count,
                                                 reduce_model, status_write)
-                st.session_state["out_final"] = final_doc
-                # The .md carries chart captions with the underlying tables intact; the
-                # PDF carries the rendered charts.
+                # Download the caption version, but KEEP the raw document (chart blocks
+                # intact) in session state so the preview and PDF can still render charts.
                 deliver_stage_output("out_final",
                                      filename_for(company_name, "final", "md"),
-                                     markdown_for_download(final_doc), "text/markdown")
+                                     markdown_for_download(final_doc), "text/markdown",
+                                     store_content=final_doc)
                 _final_pdf = markdown_to_pdf_bytes(final_doc)
                 if _final_pdf:
                     auto_download_files([(filename_for(company_name, "final", "pdf"),
