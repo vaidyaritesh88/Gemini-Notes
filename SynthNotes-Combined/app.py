@@ -1404,6 +1404,19 @@ def auto_download_files(files) -> None:
     components.html("<script>" + "\n".join(blocks) + "</script>", height=0)
 
 
+def deliver_stage_output(session_key: str, filename: str, content, mime: str) -> None:
+    """Persist a finished stage's output and push it to the browser immediately.
+
+    Called as each stage completes rather than at the end of the run. Every stage costs
+    real money and is independently useful for resuming, so a later failure must never
+    discard work that already succeeded."""
+    if not content:
+        return
+    st.session_state[session_key] = content
+    auto_download_files([(filename, content, mime)])
+    st.write(f"💾 Saved and downloaded: `{filename}`")
+
+
 def _consume_pending_auto_download() -> None:
     """Fire any downloads staged by the last successful run, exactly once."""
     pending = st.session_state.pop("pending_auto_download", None)
@@ -1706,6 +1719,14 @@ def main():
         interim_notes_text = None
         final_doc = None
 
+        # Drop any previous run's artifacts up front. If this run fails halfway, what is
+        # on screen afterwards must be THIS run's partial output, never a stale note from
+        # an earlier one presented as if it were fresh.
+        for _stale in ("out_extract", "out_interim", "out_final"):
+            st.session_state.pop(_stale, None)
+        st.session_state.pop("pending_auto_download", None)
+        st.session_state["out_company"] = company_name
+
         try:
             # ── STAGE 1: EXTRACT ─────────────────────────────────────────────
             if start_from.startswith("Start fresh"):
@@ -1723,6 +1744,9 @@ def main():
                         # Default: extracted ARs + RAW transcripts (your real workflow)
                         map_files = extracted_ar + tx_files
                         extract_text = serialize_combined_extract(extracted_ar, [])
+                    deliver_stage_output("out_extract",
+                                         filename_for(company_name, "extract", "txt"),
+                                         extract_text, "text/plain")
                     s.update(label="Stage 1 — Extraction done ✓", state="complete")
             elif start_from.startswith("I already have the extracted"):
                 map_files = extracted_files
@@ -1741,49 +1765,55 @@ def main():
                     notes_list, filenames = run_map_stage(map_files, user_prompt, target_word_count,
                                                           map_model, status_write)
                     interim_notes_text = serialize_interim(notes_list, filenames)
+                    deliver_stage_output("out_interim",
+                                         filename_for(company_name, "interim", "txt"),
+                                         interim_notes_text, "text/plain")
                     s.update(label="Stage 2 — Notes done ✓", state="complete")
 
             # ── STAGE 3: SYNTHESISE / REDUCE ─────────────────────────────────
             with st.status("Stage 3 — Writing the final note…", expanded=True) as s:
                 final_doc = hierarchical_reduce(notes_list, filenames, user_prompt, target_word_count,
                                                 reduce_model, status_write)
+                st.session_state["out_final"] = final_doc
+                # The .md carries chart captions with the underlying tables intact; the
+                # PDF carries the rendered charts.
+                deliver_stage_output("out_final",
+                                     filename_for(company_name, "final", "md"),
+                                     markdown_for_download(final_doc), "text/markdown")
+                _final_pdf = markdown_to_pdf_bytes(final_doc)
+                if _final_pdf:
+                    auto_download_files([(filename_for(company_name, "final", "pdf"),
+                                          _final_pdf, "application/pdf")])
+                    st.write(f"💾 Saved and downloaded: `{filename_for(company_name, 'final', 'pdf')}`")
                 s.update(label="Stage 3 — Final note done ✓", state="complete")
-
-            # Persist artifacts so the download buttons survive reruns
-            st.session_state["out_extract"] = extract_text
-            st.session_state["out_interim"] = interim_notes_text
-            st.session_state["out_final"] = final_doc
-            st.session_state["out_company"] = company_name
-
-            # Stage auto-download — fires once on the next render, so a lost session
-            # does not cost the run. The PDF carries the charts; the .md carries chart
-            # captions with the underlying tables intact.
-            _pending = []
-            if extract_text:
-                _pending.append((filename_for(company_name, "extract", "txt"),
-                                 extract_text, "text/plain"))
-            if interim_notes_text:
-                _pending.append((filename_for(company_name, "interim", "txt"),
-                                 interim_notes_text, "text/plain"))
-            _pending.append((filename_for(company_name, "final", "md"),
-                             markdown_for_download(final_doc), "text/markdown"))
-            _final_pdf = markdown_to_pdf_bytes(final_doc)
-            if _final_pdf:
-                _pending.append((filename_for(company_name, "final", "pdf"),
-                                 _final_pdf, "application/pdf"))
-            st.session_state["pending_auto_download"] = _pending
 
         except Exception as e:
             st.error(f"Run failed: {e}")
-            st.stop()
+            # Do NOT stop here. Whatever completed before the failure has already been
+            # saved and downloaded, and the results section below still needs to render
+            # so those artifacts stay reachable on screen.
+            _done = [label for key, label in (("out_extract", "Stage 1 extract"),
+                                              ("out_interim", "Stage 2 interim notes"))
+                     if st.session_state.get(key)]
+            if _done:
+                st.warning(
+                    "**Your completed work was saved.** " + " and ".join(_done) +
+                    " finished before the failure, downloaded automatically, and are listed "
+                    "below. Re-run using the **Start from** selector at the top to resume "
+                    "from that point — you will not pay to redo those stages."
+                )
+            else:
+                st.warning("The run failed before any stage completed, so there is nothing to save.")
 
     # ── Results (persist across reruns) ───────────────────────────────────────
-    if st.session_state.get("out_final"):
+    # Gate on ANY artifact, not on the final note: a run that failed at Stage 3 must still
+    # surface its Stage 1 and Stage 2 output, which is the whole point of saving per stage.
+    if any(st.session_state.get(k) for k in ("out_extract", "out_interim", "out_final")):
         st.divider()
         _consume_pending_auto_download()
         st.subheader("⑤ Your outputs")
-        st.markdown("Each stage's output is here. Download the interim ones too — they let you re-run a later stage "
-                    "later without paying to redo the earlier ones.")
+        st.markdown("Each stage's output is here, and each was downloaded as it completed. "
+                    "The interim ones let you re-run a later stage without paying to redo the earlier ones.")
         company = st.session_state.get("out_company", "Company")
 
         cols = st.columns(4)
@@ -1797,22 +1827,31 @@ def main():
                 st.download_button("⬇ Stage 2 · Interim notes (.txt)", data=st.session_state["out_interim"],
                                    file_name=filename_for(company, "interim", "txt"), mime="text/plain",
                                    use_container_width=True)
-        with cols[2]:
-            st.download_button("⬇ Final note (.md)", data=markdown_for_download(st.session_state["out_final"]),
-                               file_name=filename_for(company, "final", "md"), mime="text/markdown",
-                               use_container_width=True)
-        with cols[3]:
-            pdf_bytes = markdown_to_pdf_bytes(st.session_state["out_final"])
-            if pdf_bytes:
-                st.download_button("⬇ Final note (.pdf)", data=pdf_bytes,
-                                   file_name=filename_for(company, "final", "pdf"), mime="application/pdf",
+        if st.session_state.get("out_final"):
+            with cols[2]:
+                st.download_button("⬇ Final note (.md)", data=markdown_for_download(st.session_state["out_final"]),
+                                   file_name=filename_for(company, "final", "md"), mime="text/markdown",
                                    use_container_width=True)
-            else:
-                st.caption("PDF needs `markdown` + `xhtml2pdf`")
+            with cols[3]:
+                pdf_bytes = markdown_to_pdf_bytes(st.session_state["out_final"])
+                if pdf_bytes:
+                    st.download_button("⬇ Final note (.pdf)", data=pdf_bytes,
+                                       file_name=filename_for(company, "final", "pdf"), mime="application/pdf",
+                                       use_container_width=True)
+                else:
+                    st.caption("PDF needs `markdown` + `xhtml2pdf`")
 
         render_usage_panel()
-        st.markdown("### Final note preview")
-        render_markdown_with_charts(st.session_state["out_final"])
+
+        if st.session_state.get("out_final"):
+            st.markdown("### Final note preview")
+            render_markdown_with_charts(st.session_state["out_final"])
+        else:
+            st.info(
+                "No final note was produced for this run. The stage outputs above are complete "
+                "and downloaded — pick the matching **Start from** option and upload one of them "
+                "to resume without repeating the work you have already paid for."
+            )
 
 
 if __name__ == "__main__":
