@@ -25,7 +25,8 @@ Only the UI and the stage-wiring are new.
 """
 
 import streamlit as st
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import os, re, time, json, html as html_module
 from datetime import datetime
 from typing import Optional, Tuple, List
@@ -59,27 +60,42 @@ EXTRACTION_CHUNK_OVERLAP_TRANSCRIPT = 1_000
 EXTRACTION_PARALLEL_WORKERS = 6
 EXTRACTION_SKIP_MARKER = "[chunk skipped — no analyst-relevant content]"
 
+# Live models only, ordered best-quality first — kept in step with SynthNotes-Pro.
+# Removed Aug 2026: gemini-2.0-flash-lite and gemini-1.5-flash (shut down by Google,
+# calls would 404), gemini-3-flash-preview (superseded by the stable gemini-3.7-flash),
+# and gemini-3.5-flash ($1.50/$9.00 per 1M for lower quality than 3.7 Flash's
+# $0.75/$3.75 — strictly dominated).
 MODELS = {
-    "Gemini 2.5 Flash (Fast)":       "gemini-2.5-flash",
-    "Gemini 2.5 Flash Lite (Cheap)": "gemini-2.5-flash-lite",
-    "Gemini 2.5 Pro (Best)":         "gemini-2.5-pro",
-    "Gemini 3.0 Flash":              "gemini-3-flash-preview",
-    "Gemini 3.5 Flash":              "gemini-3.5-flash",
-    "Gemini 2.0 Flash":              "gemini-2.0-flash-lite",
-    "Gemini 1.5 Flash":              "gemini-1.5-flash",
+    "Gemini 3.1 Pro (Max quality, preview)": "gemini-3.1-pro-preview",
+    "Gemini 3.7 Flash (Best all-round)":     "gemini-3.7-flash",
+    "Gemini 2.5 Pro (Stable, high quality)": "gemini-2.5-pro",
+    "Gemini 2.5 Flash (Fast)":               "gemini-2.5-flash",
+    "Gemini 3.5 Flash Lite (Cheap)":         "gemini-3.5-flash-lite",
+    "Gemini 2.5 Flash Lite (Cheapest)":      "gemini-2.5-flash-lite",
 }
 
-# Approximate pricing per 1M tokens (USD), <200K context. Verified May 2026.
+# Defaults by stage. Stage 1 decides what the later stages ever get to see, so it is a
+# content-dropping step, not a mechanical one — it gets a real model for the same reason
+# Pro's refinement stage was moved off Flash Lite. Stage 3 writes the final note and
+# gets the max-quality model.
+DEFAULT_EXTRACT_MODEL = "Gemini 3.7 Flash (Best all-round)"
+DEFAULT_MAP_MODEL     = "Gemini 3.7 Flash (Best all-round)"
+DEFAULT_REDUCE_MODEL  = "Gemini 3.1 Pro (Max quality, preview)"
+
+
+def default_model_index(display_name: str) -> int:
+    """Selectbox index for a default, looked up by name so reordering MODELS is safe."""
+    keys = list(MODELS.keys())
+    return keys.index(display_name) if display_name in keys else 0
+
+# Approximate pricing per 1M tokens (USD), <200K context. Verified Aug 2026.
 MODEL_PRICING = {
+    "gemini-3.1-pro-preview": (2.00, 12.00),
+    "gemini-3.7-flash":       (0.75,  3.75),  # promo rate to 31 Dec 2026, then 1.50/7.50
     "gemini-2.5-pro":         (1.25, 10.00),
     "gemini-2.5-flash":       (0.30,  2.50),
+    "gemini-3.5-flash-lite":  (0.30,  2.50),
     "gemini-2.5-flash-lite":  (0.10,  0.40),
-    "gemini-3.5-flash":       (0.50,  3.00),
-    "gemini-3-flash-preview": (0.50,  3.00),
-    "gemini-3.1-flash-lite":  (0.25,  1.50),
-    "gemini-3.1-pro-preview": (2.00, 12.00),
-    "gemini-2.0-flash-lite":  (0.075, 0.30),
-    "gemini-1.5-flash":       (0.075, 0.30),
 }
 
 LENGTH_PRESETS = {
@@ -123,24 +139,72 @@ def resolve_api_key() -> str:
     return key
 
 
+# google-genai client. The legacy google-generativeai SDK was retired on 30 Nov 2025
+# and cannot reach the Gemini 3.x models. The key arrives at runtime (secrets, env, or
+# pasted into the sidebar), so the client is built here rather than at import.
+_client = None
+
+
 def configure_genai(key: str) -> None:
+    global _client
     if key:
         try:
-            genai.configure(api_key=key)
+            _client = genai.Client(api_key=key)
         except Exception:
-            pass
+            _client = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. MODEL HELPERS  (from MultiDoc)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_model(display_name: str) -> genai.GenerativeModel:
-    """Cache and return a GenerativeModel for the given UI label."""
+class _StreamHandle:
+    """Iterable wrapper around a google-genai streaming response.
+
+    The raw stream is a generator, so the tracking attributes generate_with_retry
+    attaches cannot be set on it directly the way the old SDK allowed. This holds them
+    and captures usage_metadata as chunks go past, so stream_and_collect can still
+    record cost once iteration finishes."""
+
+    def __init__(self, stream, model_id: str, stage: str = ""):
+        self._stream = stream
+        self._tracked_model_id = model_id
+        self._tracked_stage = stage
+        self.usage_metadata = None
+
+    def __iter__(self):
+        for chunk in self._stream:
+            usage = getattr(chunk, "usage_metadata", None)
+            if usage is not None:
+                self.usage_metadata = usage
+            yield chunk
+
+
+class _ModelHandle:
+    """Adapter exposing the old `.generate_content(...)` signature on top of
+    google-genai, so every existing call site keeps working unchanged."""
+
+    def __init__(self, model_id: str):
+        self.model_name = model_id
+
+    def generate_content(self, prompt, stream: bool = False, generation_config=None):
+        if _client is None:
+            raise RuntimeError("No Gemini API key configured - cannot call the API.")
+        contents = prompt if isinstance(prompt, list) else [prompt]
+        config = types.GenerateContentConfig(**generation_config) if generation_config else None
+        if stream:
+            return _StreamHandle(_client.models.generate_content_stream(
+                model=self.model_name, contents=contents, config=config), self.model_name)
+        return _client.models.generate_content(
+            model=self.model_name, contents=contents, config=config)
+
+
+def get_model(display_name: str) -> "_ModelHandle":
+    """Cache and return a model handle for the given UI label."""
     cache = st.session_state.setdefault("_model_cache", {})
-    model_id = MODELS.get(display_name, "gemini-2.5-flash")
+    model_id = MODELS.get(display_name, "gemini-3.7-flash")
     if model_id not in cache:
-        cache[model_id] = genai.GenerativeModel(model_id)
+        cache[model_id] = _ModelHandle(model_id)
     return cache[model_id]
 
 
@@ -199,8 +263,9 @@ def stream_and_collect(response, placeholder=None) -> Tuple[str, int]:
     """Iterate a streamed response, collect text, auto-record usage if tagged."""
     full_text, counter = "", 0
     for chunk in response:
-        if chunk.parts:
-            full_text += chunk.text
+        piece = getattr(chunk, "text", None)
+        if piece:
+            full_text += piece
             counter += 1
             if placeholder and counter % 5 == 0:
                 placeholder.caption(f"Streaming… {len(full_text.split()):,} words")
@@ -1145,13 +1210,19 @@ def main():
         st.divider()
         st.subheader("Models")
         st.caption("Cheap models are fine for the mechanical stages; the quality model matters only for the final write-up.")
-        extract_model_name = st.selectbox("Stage 1 — Extraction model", list(MODELS.keys()), index=1,
-                                          help="Just keep/skip classification. Flash Lite is plenty (~$0.10 per annual report).")
-        map_model_name = st.selectbox("Stage 2 — Notes model", list(MODELS.keys()), index=0,
-                                      help="Turns each chunk into notes. Flash is a good balance.")
-        reduce_model_name = st.selectbox("Stage 3 — Synthesis model", list(MODELS.keys()), index=3,
-                                        help="Writes the final note. Gemini 3.0 Flash — matches what you used in "
-                                             "MultiDoc/MultiDocLean. Switch to Pro here if you want maximum quality.")
+        extract_model_name = st.selectbox("Stage 1 — Extraction model", list(MODELS.keys()),
+                                          index=default_model_index(DEFAULT_EXTRACT_MODEL),
+                                          help="Decides which passages the later stages ever see, so anything it "
+                                               "drops is gone for good. 3.7 Flash costs more than Flash Lite per "
+                                               "annual report, and is worth it.")
+        map_model_name = st.selectbox("Stage 2 — Notes model", list(MODELS.keys()),
+                                      index=default_model_index(DEFAULT_MAP_MODEL),
+                                      help="Turns each chunk into notes. 3.7 Flash is the balance point.")
+        reduce_model_name = st.selectbox("Stage 3 — Synthesis model", list(MODELS.keys()),
+                                        index=default_model_index(DEFAULT_REDUCE_MODEL),
+                                        help="Writes the final note — the stage where model quality shows most. "
+                                             "3.1 Pro is the strongest available; switch to 2.5 Pro if you want a "
+                                             "stable (non-preview) model.")
 
         st.divider()
         st.subheader("Final note length")

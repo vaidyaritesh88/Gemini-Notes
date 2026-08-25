@@ -1,4 +1,4 @@
-google-generativeai
+google-genai
 streamlit>=1.47.0
 python-dotenv
 markdown
