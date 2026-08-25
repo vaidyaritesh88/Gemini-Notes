@@ -3,3 +3,4 @@ streamlit>=1.47.0
 python-dotenv
 markdown
 xhtml2pdf
+matplotlib

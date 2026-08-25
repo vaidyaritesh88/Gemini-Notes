@@ -27,7 +27,7 @@ Only the UI and the stage-wiring are new.
 import streamlit as st
 from google import genai
 from google.genai import types
-import os, re, time, json, html as html_module
+import os, io, re, time, json, base64, html as html_module
 from datetime import datetime
 from typing import Optional, Tuple, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -308,17 +308,22 @@ KEEP these sections — output them VERBATIM (do not paraphrase, summarise, or a
 - Chairman's Letter / Managing Director's Letter / CEO's Letter
 - Management Discussion and Analysis (MD&A) — all sub-sections
 - Business Performance / Business Review / Operations Review
-- Segment / Geography / Business Vertical Performance (narrative form)
+- Segment / Geography / Business Vertical Performance (narrative AND tabular form)
+- Financial Highlights / Performance at a Glance / 5-year or 10-year summary tables
+- The summary Profit & Loss and Balance Sheet, and for lenders the NII / NIM / PPOP /
+  credit cost / GNPA / NNPA / RoA / RoE / AUM and loan-book-mix disclosures
+- Segment information tables (segment revenue, segment results, segment assets)
+- Key operating metrics tables (volumes, capacity, realisations, branch/store counts)
 - Strategy / Strategic Direction / Future Outlook / Five-Year View
 - Director's Report — narrative business commentary only (skip the routine governance text)
 - Business Responsibility Report — only if it contains substantive business content
 
 SKIP these sections entirely (output nothing for these):
 - Notice of AGM
-- Standalone / Consolidated Financial Statements (balance sheet, P&L, cash flow)
-- Notes to Accounts
+- Notes to Accounts (the detailed numbered notes), EXCEPT any note carrying segment
+  information or a business-mix breakdown
 - Significant Accounting Policies
-- Schedules, annexures, related documents
+- Schedules and annexures that are pure statutory detail
 - Related Party Transactions
 - Statutory disclosures, secretarial audit, compliance reports
 - Auditor's Report and Independent Auditor's Report
@@ -334,6 +339,11 @@ INSTRUCTIONS
 4. If a chunk crosses a boundary (e.g., MD&A ends and Notes to Accounts begins), output only the relevant part and end with `[remainder skipped — non-narrative]`.
 5. If the WHOLE chunk is SKIP material, output exactly: `[chunk skipped — no analyst-relevant content]`
 6. When in doubt, KEEP. Loss of a narrative passage is worse than retaining a borderline one.
+   The same applies to figures: a downstream stage builds a key-financials section and a
+   quantitative reference from whatever survives here, so preserve summary financial
+   tables, segment splits and operating metrics VERBATIM, with their units, their period
+   labels (FY22, Q3FY24) and their footnotes. Never round, never convert, never redraw a
+   table into prose.
 7. Do NOT add commentary about what you found. Do NOT add section labels you've invented.
 """
 
@@ -400,16 +410,17 @@ MAP_PROMPT_TEMPLATE = """You are extracting structured notes from a section of a
 DEFAULT_USER_PROMPT = """ROLE
 You are an experienced equity analyst explaining ONE company to a sharp colleague who
 knows markets but not this company. Write the way you'd actually talk it through: in plain
-English, as a STORY, landing the things that matter and leaving out the noise. Your reader
-is an investment analyst, not an engineer — explain the business in business terms, never
-in procurement or product-brochure language.
+English, landing the things that matter and leaving out the noise. Your reader is an
+investment analyst, not an engineer — explain the business in business terms, never in
+procurement or product-brochure language.
 
 SOURCES
 All documents in this project: ~5 years of earnings-call transcripts, the last few
 investor presentations, and recent annual reports. Read them together. The transcripts —
 especially the analyst Q&A — are where management explains the WHY, so they carry the
-story. Annual reports are only for hard facts (segment splits, capacity, balance sheet);
-never reproduce their narrative or outlook prose, which is generic boilerplate.
+story. Annual reports supply the hard facts: the financial-highlights tables, segment and
+loan-book splits, capacity and balance-sheet data that Sections 1 and 9 are built from.
+Never reproduce annual-report narrative or outlook prose, which is generic boilerplate.
 
 TWO ABSOLUTE RULES
 1. FACT before INTERPRETATION, always visually separate. State what management said or what
@@ -417,92 +428,156 @@ TWO ABSOLUTE RULES
    paragraph beginning "My read:" — the ONLY place your inference may appear. A reader must
    be able to skip every "My read:" and still have a complete, accurate account of what the
    company and management actually said.
-2. No outside data, no invented quotes. Not in the documents = say so. Quotes ≤25 words,
-   exact; otherwise paraphrase.
+2. No outside data, no invented quotes, no estimated figures. Not in the documents = say so
+   explicitly ("not disclosed in the documents"). Never fill a gap in a table with a guess,
+   an interpolation, or a number carried over from another year. Quotes <=25 words, exact;
+   otherwise paraphrase.
 
-READABILITY RULES — how to write so it's retained
-- Flowing paragraphs. No big tables, no bullet dumps, no reference codes, no
-  quarter-by-quarter logs.
-- FORMATTING FOR NAVIGATION: under each numbered section, break the prose with short bold
-  sub-headings (a few words each) that signal what the next paragraph(s) cover, so the
-  reader can scan the structure and find their place. Sub-headings label the content; they
-  don't replace the prose — write full paragraphs under each, not bullets. Use 2-5
-  sub-headings per section as the material needs; don't force them where a section is short.
-- Depth comes from EXPLAINING A FEW THINGS FULLY, not from listing many. For every claim
-  that matters, give the mechanism — the WHY behind it — in plain words. A reader should
-  finish each section understanding not just what happened but why.
-- When a point recurs across many quarters, say so plainly ("management has said for six
-  straight quarters that…") — repetition is the signal of what's load-bearing, and it's
-  what the reader will remember.
-- Round numbers, ranges, direction. You're telling a story, not reconciling a model.
-- Cut anything that only makes sense with heavy context you haven't given. If it matters,
-  give the context in half a sentence; if it doesn't, drop it.
-- The test for every paragraph: could the reader repeat this back to someone tomorrow? If
-  it's a pile of disconnected details, rewrite it as a point with a reason.
+HOW TO WRITE — FORMAT
+The old version of this note was unbroken prose and was hard to read. Mix the two forms:
+- **Short paragraphs** (3-6 sentences) carry an ARGUMENT — anything with a "because" in it,
+  any mechanism, any judgement. Reasoning belongs in prose.
+- **Bullets** carry PARALLEL ITEMS — a set of drivers, segments, risks, guidance points,
+  or figures that sit at the same level. Lists belong in bullets.
+- The test: if the items need connecting words to make sense together, write a paragraph.
+  If they'd read as "X, and also Y, and also Z", write bullets.
+- Never run more than two consecutive paragraphs without a bold sub-heading or a bulleted
+  list breaking them up. A wall of prose is a defect.
+- **Bold sub-headings** (a few words) every 2-4 paragraphs, labelling what comes next.
+- **Tables** belong in Sections 1 and 9 only. Do not put tables in the narrative sections.
+- Numbers: round in the narrative (Sections 2-7) — "margins went from roughly 11% to 14%".
+  Exact, as-reported, with units and period labels in Sections 1 and 9.
 
-WRITE THE NOTE IN THIS ORDER, AS FLOWING PROSE UNDER EACH HEADING (with bold sub-headings
-inside each section per the formatting rule above):
+LENGTH AND COMPLETENESS
+Sections 2-7 are the body of the note and must be written at full depth — the same depth
+as if Sections 1, 8 and 9 did not exist. The new sections are ADDITIONS, not a budget to
+be found by trimming the story. Nothing that belongs in the narrative may be dropped,
+shortened, or deferred to the summary on the grounds that it appears there too. Section 8
+repeats; it does not replace.
 
-1. WHAT THIS COMPANY DOES
-   In plain English: what does it sell, and to whom? Break revenue into its main buckets in
-   words (roughly what % each is), and for each, say who the customer is (state utilities /
-   private industrial capex / EPC contractors / OEMs / exports) and what that product does
-   for them. Where product type drives the economics — e.g. higher-voltage transformers are
-   harder to make, so fewer players and better margins — explain it that way, in cause-and-
-   effect business terms, not spec-sheet terms. Domestic vs export, plainly.
-   My read: where the genuinely attractive part of the mix sits, and why.
+═══════════════════════════════════════════════════════════════════════════════
+WRITE THE NOTE IN THIS ORDER
+═══════════════════════════════════════════════════════════════════════════════
 
-2. THE STORY OF THE LAST 5 YEARS  (the heart of the note — give this the most space)
-   Tell it as a narrative, not a ledger. Cover, and connect, these threads:
-   - GROWTH: how sales and EBITDA grew, and crucially WHERE the growth came from — which
-     products/end-markets pulled it and WHY that demand appeared (a capex cycle, a policy
-     push, exports, a competitor stumbling, share gains). Don't just name the driver —
-     explain the mechanism behind it.
-   - MARGINS: what happened to margins and WHY — pricing power because the market was tight?
-     richer mix? or squeezed by a specific raw material? Say which, and whether management
-     framed the gains as durable or temporary.
-   - ORDER BOOK: how it grew and what it's signalling, since it leads sales — and whether
-     management said anything about the QUALITY (margin) of the book, not just its size.
-   - CAPACITY: how capacity expansion played out — did they add it, did it arrive in time,
-     did demand absorb it, or did they expand into a hot market late?
-   Weave these into one story, anchored on the few drivers that genuinely mattered, so the
-   reader can repeat the arc back. (Natural sub-headings here: the growth drivers, margins,
-   order book, capacity — use them as your bold sub-heads.)
-   My read: how much of this growth is structural versus a cyclical/peak moment, and which
-   parts I'd trust to persist.
+## 1. THE BUSINESS AT A GLANCE
+The basics, before any story. A reader who knows nothing should finish this section
+knowing what the company sells, to whom, and what its numbers look like. No narrative
+arc here, no interpretation beyond one closing "My read:".
 
-3. WHY THIS COMPANY WINS  (competitive advantage)
-   What actually lets them win business and hold margin — technology, approvals and track
-   record, customer relationships, scale, being one of few who can do the hard work?
-   Explain it as why a customer picks them over the next supplier.
-   My read: whether that edge is durable or just today's tightness flattering everyone.
+**What this business does** — 4-6 bullets, one line each: what it sells, who buys it,
+how it makes money, where it operates, how big it is. Plain language.
 
-4. COMPETITION, AND HOW MANAGEMENT TALKS ABOUT IT
-   Who they compete with, and what management says when analysts push on new competition,
-   new capacity coming in, imports, or pricing pressure — do they sound relaxed or guarded,
-   and have they admitted any share loss or pricing slippage? Whether they engage the
-   question or deflect it is itself informative.
-   My read: whether the competitive threat is real and how honestly management is facing it.
+**Revenue split** (or **Loan book split** for a lender) — a markdown table of the mix by
+segment / product / geography / customer type, with the split for the most recent period
+and, where the documents allow, the same split 3-5 years earlier so the shift is visible.
+State the period labels and the unit in the header. Add one line under the table naming
+what changed in the mix and by how much.
 
-5. WHAT MANAGEMENT EXPECTS NEXT  (their words, kept clearly as their words)
-   Pull together what management has guided or signalled on demand and sales growth, order-
-   book outlook, and margins — and the REASONS they give for each, since the reasoning
-   matters more than the number. Include their stated plans on capacity and capital
-   allocation. Keep this strictly "management says," never blended with your own view.
-   My read: which expectations look well-supported versus optimistic, and what they're
-   quietly assuming.
+**Key financials** — a markdown table, years as columns, most recent last. Pick the metric
+set that fits the business:
+- **Lender (bank / NBFC / HFC / MFI):** NII, NIM (%), PPOP, Credit Cost (%), GNPA (%),
+  NNPA (%), PAT, RoA (%), RoE (%), and AUM or loan book with its growth.
+- **Everything else:** Revenue, EBITDA, EBITDA margin (%), PAT, PAT margin (%), and where
+  the documents give them: order book, capacity, volumes, realisations, RoCE / RoE.
+- **Insurer / AMC / exchange / other financial:** use the metric set the company itself
+  reports (APE, VNB margin, AUM, yields, take-rate) rather than forcing either template.
+Report only what the documents contain. Where a cell is not disclosed, write "n/a" — never
+estimate. Below the table, 3-5 bullets naming the most striking movements in it.
 
-6. WHAT TO REMEMBER
-   Close with a short paragraph: the handful of things a busy investor should actually
-   carry away — the load-bearing points that recurred and matter. Plain sentences, no grab-
-   bag. This is the part the reader keeps.
+**Charts** — for the two or three most important series in this section, emit a chart block
+in exactly this format, on its own lines:
 
-LENGTH & TONE
-Long enough to do justice to section 2, short enough to read in one sitting and summarise
-from memory. Depth on the things that matter, silence on the things that don't. If a
-section is thin in the sources, keep it short and say what's missing — never pad with
-generic industry talk.
+```synthnotes-chart
+{"title": "Revenue and EBITDA margin", "type": "line", "x": ["FY21","FY22","FY23","FY24","FY25"], "unit": "Rs cr", "series": [{"name": "Revenue", "values": [1200, 1450, 1810, 2200, 2610]}]}
+```
+
+Rules for chart blocks: `type` is "line" or "bar". `x` is the period labels. Every series
+must have exactly as many `values` as there are `x` labels — use `null` for a period the
+documents do not disclose. Use only figures that appear in your table above. Emit 2-4
+chart blocks, no more. If the documents do not support a clean series, emit no chart block
+at all — a missing chart is fine, an invented one is not.
+
+My read: what the shape of these numbers tells you before we get into the story.
+
+## 2. THE STORY OF THE LAST 5 YEARS  (the heart of the note — most space)
+Tell it as a narrative, not a ledger. Cover, and connect, these threads:
+- GROWTH: how sales and EBITDA grew, and crucially WHERE the growth came from — which
+  products/end-markets pulled it and WHY that demand appeared (a capex cycle, a policy
+  push, exports, a competitor stumbling, share gains). Don't just name the driver —
+  explain the mechanism behind it.
+- MARGINS: what happened to margins and WHY — pricing power because the market was tight?
+  richer mix? or squeezed by a specific raw material? Say which, and whether management
+  framed the gains as durable or temporary.
+- ORDER BOOK (or LOAN BOOK / AUM): how it grew and what it's signalling, since it leads
+  sales — and whether management said anything about its QUALITY (margin, or asset
+  quality), not just its size.
+- CAPACITY (or BRANCH / DISTRIBUTION BUILD-OUT): did they add it, did it arrive in time,
+  did demand absorb it, or did they expand into a hot market late?
+Weave these into one story anchored on the few drivers that genuinely mattered. Use bold
+sub-headings for each thread, prose for the mechanisms, bullets where you are listing
+parallel drivers or a sequence of events.
+My read: how much of this growth is structural versus a cyclical/peak moment, and which
+parts I'd trust to persist.
+
+## 3. WHY THIS COMPANY WINS  (competitive advantage)
+What actually lets them win business and hold margin — technology, approvals and track
+record, customer relationships, scale, being one of few who can do the hard work?
+Explain it as why a customer picks them over the next supplier.
+My read: whether that edge is durable or just today's tightness flattering everyone.
+
+## 4. COMPETITION, AND HOW MANAGEMENT TALKS ABOUT IT
+Who they compete with, and what management says when analysts push on new competition,
+new capacity coming in, imports, or pricing pressure — do they sound relaxed or guarded,
+and have they admitted any share loss or pricing slippage? Whether they engage the
+question or deflect it is itself informative.
+My read: whether the competitive threat is real and how honestly management is facing it.
+
+## 5. WHAT MANAGEMENT EXPECTS NEXT  (their words, kept clearly as their words)
+Pull together what management has guided or signalled on demand and sales growth, order-
+book outlook, and margins — and the REASONS they give for each, since the reasoning
+matters more than the number. Include their stated plans on capacity and capital
+allocation. Bullets work well for the guidance points themselves; use prose for the
+reasoning behind them. Keep this strictly "management says", never blended with your view.
+My read: which expectations look well-supported versus optimistic, and what they're
+quietly assuming.
+
+## 6. WHAT TO REMEMBER
+A short section: the handful of things a busy investor should actually carry away — the
+load-bearing points that recurred and matter. Plain sentences, no grab-bag.
+
+## 7. THE NOTE IN ONE PAGE
+The whole story compressed to roughly 500-600 words — what this business is, what happened
+over five years and why, what makes it win, what could break it, and what management
+expects next. Written so someone who reads ONLY this page comes away with the argument
+intact. Lead with a 3-4 sentence paragraph stating the story in full, then 6-10 bullets
+carrying the supporting points. No new material may appear here that is not already
+somewhere above.
+
+## 8. ALL THE NUMBERS IN ONE PLACE
+Every quantitative fact in the note, collected for quick reference — the reader should
+never have to hunt back through the prose for a figure. Organise as markdown tables under
+bold sub-headings, in this order where the material exists:
+- **Financial summary** — the Section 1 table, repeated in full.
+- **Segment / product / geography splits** — revenue or loan book by cut, across periods.
+- **Operating metrics** — volumes, capacity, utilisation, realisations, branch or store
+  counts, employee counts, order book, AUM.
+- **Asset quality and returns** (lenders) — GNPA, NNPA, PCR, credit cost, restructured
+  book, RoA, RoE, capital adequacy.
+- **Balance sheet and cash flow** — debt, net debt, D/E, working capital, capex, OCF, FCF.
+- **Guidance and targets** — every forward-looking number management has given, each with
+  the period it refers to and the quarter it was said in.
+- **Valuation and capital-return data** — only if the documents contain it.
+Rules: every figure must carry its unit and its period label. Report as-reported, never
+converted or rounded. Where a metric was disclosed in some periods and not others, show
+the periods you have and "n/a" elsewhere. This section is a reference table, not prose —
+no commentary, no "My read:".
+
+TONE
+Long enough to do justice to Section 2, short enough to read in one sitting. Depth on the
+things that matter, silence on the things that don't. If a section is thin in the sources,
+keep it short and say what's missing — never pad with generic industry talk.
 """
+
 
 # ── Reduce prompts (Stage 3) — from MultiDoc ───────────────────────────────────
 REDUCE_PROMPT_TEMPLATE = """You are synthesising a final consolidated document from notes extracted across multiple source documents.
@@ -582,12 +657,27 @@ Produce a structured outline of the final document. Use EXACTLY this format:
 
 (continue for all sections)
 
-TOTAL: ~[sum of all section budgets — must be close to {target_word_count}] words
+TOTAL: ~[sum of the NARRATIVE section budgets — must be close to {target_word_count}] words, plus ~1850 words of mandatory sections
 CHRONOLOGY_NOTE: [one sentence about how sections are ordered, e.g. "Sections are in chronological order from Q1 2023 to Q4 2024" OR "Chronology could not be inferred; sections are organised by topic."]
 
+### MANDATORY SECTIONS — these three are fixed and always present
+The user's instructions specify an opening section and two closing sections. Reproduce
+them as the first and last sections of your outline, with these headings and budgets:
+
+- **First section**, heading `## 1. THE BUSINESS AT A GLANCE` — word budget ~600 words.
+- **Second-to-last**, heading `## THE NOTE IN ONE PAGE` — word budget ~550 words.
+- **Last section**, heading `## ALL THE NUMBERS IN ONE PLACE` — word budget ~700 words.
+
+**These three budgets sit ON TOP of the target and do NOT count towards it.** They are
+structural additions; they must not be funded by shrinking the narrative. The narrative
+sections between them still have the full ~{target_word_count} words to share.
+
 ### RULES
-1. Section count: typically **5–10 sections**, scaled to content and length target. With ~{target_word_count} words and dense source material, lean toward more sections (8–10) rather than fewer.
-2. Word budgets MUST sum to approximately **{target_word_count}** (±10%).
+1. Section count: the three mandatory sections above, PLUS typically **5–8 narrative
+   sections** between them, scaled to content and length target.
+2. The word budgets of the NARRATIVE sections (everything except the three mandatory ones)
+   MUST sum to approximately **{target_word_count}** (±10%). Do not subtract the mandatory
+   sections' budgets from that total — they are additional.
 3. Each section should be coherent, self-contained, and cover distinct material (no overlap between sections).
 4. Section headings should reflect the user's instructions in form and tone.
 5. Do NOT write any prose body — only the outline structure.
@@ -627,10 +717,18 @@ Aim for **~{section_word_budget} words**. This is a firm target, not a suggestio
 1. **Stay strictly within your section's coverage scope.** The outline above lists other sections — their material is theirs, not yours.
 2. Use ONLY information from the per-section notes below — no external knowledge, no inference.
 3. Preserve hard data (numbers, percentages, dates, named entities, monetary values, named geographies) from the source notes.
-4. Apply the user's instructions for formatting (prose, bullets, sub-headings) within this section.
-5. Begin your output with the heading line exactly: `## {section_heading}`
-6. Do NOT include preamble like "This section covers…" — start with content immediately after the heading.
-7. Do NOT include a conclusion that summarises other sections — the final document has its own flow.
+4. Apply the user's formatting instructions within this section. In particular: mix short
+   paragraphs with bullet lists — paragraphs for reasoning and mechanisms, bullets for
+   parallel items — and never run more than two consecutive paragraphs without a bold
+   sub-heading or a bulleted list breaking them up.
+5. Tables and chart blocks belong ONLY in the sections whose assignment calls for them
+   (the opening key-financials section and the closing numbers section). If your section
+   is one of those, reproduce figures exactly as the notes give them, with units and
+   period labels, and write "n/a" for anything not disclosed rather than estimating.
+6. Begin your output with the heading line exactly: `## {section_heading}`
+7. Do NOT include preamble like "This section covers…" — start with content immediately after the heading.
+8. Do NOT include a conclusion that summarises other sections — the final document has its own flow.
+   (The one-page summary section is the single exception: summarising the rest IS its assignment.)
 
 ### PER-SECTION NOTES (full set — extract content relevant to YOUR section)
 {combined_notes}
@@ -1073,6 +1171,191 @@ def hierarchical_reduce(notes_list, filenames, user_prompt, target_word_count, r
 # 7. EXPORT + COST  (from MultiDoc)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CHARTS
+# ══════════════════════════════════════════════════════════════════════════════
+# The synthesis prompt asks for time-series charts as fenced ```synthnotes-chart blocks
+# holding JSON. Everything here is best-effort and additive: a block that will not parse,
+# or that fails validation, is dropped without comment. The figures are also present in
+# the markdown table the chart was built from, so a missing chart loses no information.
+
+CHART_BLOCK_RE = re.compile(r"```synthnotes-chart\s*\n(.*?)\n?```", re.DOTALL)
+CHART_PLACEHOLDER = "@@SYNTHNOTES_CHART_%d@@"
+CHART_PLACEHOLDER_RE = re.compile(r"@@SYNTHNOTES_CHART_(\d+)@@")
+
+
+def _valid_chart_spec(spec) -> bool:
+    """A spec is usable only if every series lines up with the x labels."""
+    if not isinstance(spec, dict):
+        return False
+    x = spec.get("x")
+    series = spec.get("series")
+    if not isinstance(x, list) or not x or not isinstance(series, list) or not series:
+        return False
+    for entry in series:
+        if not isinstance(entry, dict):
+            return False
+        values = entry.get("values")
+        if not isinstance(values, list) or len(values) != len(x):
+            return False
+        for v in values:
+            if v is not None and not isinstance(v, (int, float)):
+                return False
+    return True
+
+
+def parse_chart_blocks(md_text: str):
+    """Split chart blocks out of the markdown.
+
+    Returns (markdown_with_placeholders, [spec, ...]). Invalid blocks are removed
+    entirely rather than left in the document as raw JSON."""
+    specs = []
+
+    def _swap(match):
+        try:
+            spec = json.loads(match.group(1).strip())
+        except Exception:
+            return ""
+        if not _valid_chart_spec(spec):
+            return ""
+        specs.append(spec)
+        return "\n" + (CHART_PLACEHOLDER % (len(specs) - 1)) + "\n"
+
+    return CHART_BLOCK_RE.sub(_swap, md_text), specs
+
+
+def markdown_for_download(md_text: str) -> str:
+    """Plain-text-friendly markdown: chart blocks become a one-line caption.
+
+    Nothing is lost — the prompt requires chart values to come from the table printed
+    immediately above the block."""
+    def _caption(match):
+        try:
+            spec = json.loads(match.group(1).strip())
+        except Exception:
+            return ""
+        # Same validation as parse_chart_blocks, so the text version never advertises a
+        # chart that the rendered versions dropped.
+        if not _valid_chart_spec(spec):
+            return ""
+        return "*Chart: %s*" % spec.get("title", "chart")
+
+    return CHART_BLOCK_RE.sub(_caption, md_text)
+
+
+def render_chart_png(spec) -> Optional[bytes]:
+    """Render one chart spec to PNG bytes. Returns None if matplotlib is unavailable
+    or anything at all goes wrong — callers treat charts as optional."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    try:
+        x = [str(label) for label in spec["x"]]
+        series = spec["series"]
+        kind = str(spec.get("type", "line")).lower()
+        positions = list(range(len(x)))
+
+        fig, ax = plt.subplots(figsize=(8, 3.6), dpi=150)
+        if kind == "bar":
+            width = 0.8 / max(len(series), 1)
+            for i, entry in enumerate(series):
+                values = [float("nan") if v is None else v for v in entry["values"]]
+                offsets = [p - 0.4 + width * (i + 0.5) for p in positions]
+                ax.bar(offsets, values, width=width, label=str(entry.get("name", "series")))
+        else:
+            for entry in series:
+                values = [float("nan") if v is None else v for v in entry["values"]]
+                ax.plot(positions, values, marker="o", linewidth=2,
+                        label=str(entry.get("name", "series")))
+        ax.set_xticks(positions)
+        ax.set_xticklabels(x)
+        if spec.get("title"):
+            ax.set_title(str(spec["title"]), fontsize=11, fontweight="bold")
+        if spec.get("unit"):
+            ax.set_ylabel(str(spec["unit"]), fontsize=9)
+        if len(series) > 1:
+            ax.legend(fontsize=8, frameon=False)
+        ax.grid(axis="y", linestyle=":", alpha=0.5)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        fig.tight_layout()
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+    except Exception:
+        return None
+
+
+def render_markdown_with_charts(md_text: str) -> None:
+    """Render the note in Streamlit, drawing any chart blocks inline where they sit."""
+    body, specs = parse_chart_blocks(md_text)
+    for part in CHART_PLACEHOLDER_RE.split(body):
+        if part.isdigit() and int(part) < len(specs):
+            png = render_chart_png(specs[int(part)])
+            if png:
+                st.image(png, use_container_width=True)
+        elif part.strip():
+            st.markdown(part)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTO-DOWNLOAD  (ported from SynthNotes-Pro)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def auto_download_files(files) -> None:
+    """Trigger browser downloads for (filename, content, mime) tuples.
+
+    Content may be str or bytes. Downloads are staggered by 600ms so browsers do not
+    block them. The first multi-file download per site prompts the user for permission;
+    it is silent after that."""
+    if not files:
+        return
+    blocks = []
+    for i, (filename, content, mime) in enumerate(files):
+        if isinstance(content, (bytes, bytearray)):
+            payload = json.dumps(base64.b64encode(bytes(content)).decode("ascii"))
+            make_blob = (
+                "  var bin = atob(%s);\n"
+                "  var arr = new Uint8Array(bin.length);\n"
+                "  for (var j = 0; j < bin.length; j++) { arr[j] = bin.charCodeAt(j); }\n"
+                "  var blob = new Blob([arr], {type: %s});\n" % (payload, json.dumps(mime))
+            )
+        else:
+            make_blob = "  var blob = new Blob([%s], {type: %s});\n" % (
+                json.dumps(content), json.dumps(mime))
+        blocks.append(
+            "setTimeout(function() {\n"
+            + make_blob
+            + "  var url = URL.createObjectURL(blob);\n"
+            "  var a = document.createElement('a');\n"
+            "  a.href = url;\n"
+            "  a.download = %s;\n" % json.dumps(filename)
+            + "  document.body.appendChild(a);\n"
+            "  a.click();\n"
+            "  setTimeout(function() { URL.revokeObjectURL(url); document.body.removeChild(a); }, 200);\n"
+            "}, %d);" % (i * 600)
+        )
+    components.html("<script>" + "\n".join(blocks) + "</script>", height=0)
+
+
+def _consume_pending_auto_download() -> None:
+    """Fire any downloads staged by the last successful run, exactly once."""
+    pending = st.session_state.pop("pending_auto_download", None)
+    if pending:
+        auto_download_files(pending)
+        st.success(
+            "✓ Auto-downloaded to your downloads folder: "
+            + " · ".join("`%s`" % f[0] for f in pending)
+            + "  *(the first multi-file download per site may ask your browser for permission)*"
+        )
+
+
 def markdown_to_pdf_bytes(md_text, title="SynthNotes Combined Output") -> Optional[bytes]:
     try:
         import markdown as md_lib
@@ -1080,7 +1363,17 @@ def markdown_to_pdf_bytes(md_text, title="SynthNotes Combined Output") -> Option
         import io
     except ImportError:
         return None
-    html_body = md_lib.markdown(md_text, extensions=["tables", "fenced_code", "nl2br"])
+    body_md, chart_specs = parse_chart_blocks(md_text)
+    html_body = md_lib.markdown(body_md, extensions=["tables", "fenced_code", "nl2br"])
+    # Swap each placeholder for the rendered chart. A chart that fails to render is
+    # replaced with nothing, leaving the surrounding table untouched.
+    for i, spec in enumerate(chart_specs):
+        png = render_chart_png(spec)
+        replacement = ""
+        if png:
+            replacement = '<img src="data:image/png;base64,%s" style="width:16cm" />' % (
+                base64.b64encode(png).decode("ascii"))
+        html_body = html_body.replace(CHART_PLACEHOLDER % i, replacement)
     safe_title = html_module.escape(title)
     html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>{safe_title}</title>
 <style>
@@ -1093,6 +1386,7 @@ def markdown_to_pdf_bytes(md_text, title="SynthNotes Combined Output") -> Option
   blockquote {{ border-left: 3px solid #ccc; padding-left: 10px; margin-left: 0; color: #555; font-style: italic; }}
   table {{ border-collapse: collapse; margin: 10px 0; }} td, th {{ border: 1px solid #ddd; padding: 5px 8px; font-size: 10pt; }}
   th {{ background: #f0f2f6; font-weight: bold; }}
+  img {{ margin: 10px 0; }}
 </style></head><body>{html_body}</body></html>"""
     import io
     pdf_buf = io.BytesIO()
@@ -1398,6 +1692,24 @@ def main():
             st.session_state["out_final"] = final_doc
             st.session_state["out_company"] = company_name
 
+            # Stage auto-download — fires once on the next render, so a lost session
+            # does not cost the run. The PDF carries the charts; the .md carries chart
+            # captions with the underlying tables intact.
+            _pending = []
+            if extract_text:
+                _pending.append((filename_for(company_name, "extract", "txt"),
+                                 extract_text, "text/plain"))
+            if interim_notes_text:
+                _pending.append((filename_for(company_name, "interim", "txt"),
+                                 interim_notes_text, "text/plain"))
+            _pending.append((filename_for(company_name, "final", "md"),
+                             markdown_for_download(final_doc), "text/markdown"))
+            _final_pdf = markdown_to_pdf_bytes(final_doc)
+            if _final_pdf:
+                _pending.append((filename_for(company_name, "final", "pdf"),
+                                 _final_pdf, "application/pdf"))
+            st.session_state["pending_auto_download"] = _pending
+
         except Exception as e:
             st.error(f"Run failed: {e}")
             st.stop()
@@ -1405,6 +1717,7 @@ def main():
     # ── Results (persist across reruns) ───────────────────────────────────────
     if st.session_state.get("out_final"):
         st.divider()
+        _consume_pending_auto_download()
         st.subheader("⑤ Your outputs")
         st.markdown("Each stage's output is here. Download the interim ones too — they let you re-run a later stage "
                     "later without paying to redo the earlier ones.")
@@ -1422,7 +1735,7 @@ def main():
                                    file_name=filename_for(company, "interim", "txt"), mime="text/plain",
                                    use_container_width=True)
         with cols[2]:
-            st.download_button("⬇ Final note (.md)", data=st.session_state["out_final"],
+            st.download_button("⬇ Final note (.md)", data=markdown_for_download(st.session_state["out_final"]),
                                file_name=filename_for(company, "final", "md"), mime="text/markdown",
                                use_container_width=True)
         with cols[3]:
@@ -1436,7 +1749,7 @@ def main():
 
         render_usage_panel()
         st.markdown("### Final note preview")
-        st.markdown(st.session_state["out_final"])
+        render_markdown_with_charts(st.session_state["out_final"])
 
 
 if __name__ == "__main__":
