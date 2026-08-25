@@ -981,6 +981,63 @@ _COVERAGE_RE = re.compile(r"^[-*]?\s*(?:Coverage|Covers|Description|Content|What
 _BUDGET_RE = re.compile(r"^[-*]?\s*(?:Word\s*budget|Words|Length|Target\s*words?|Budget|Approx\.?\s*words)\s*:\s*(.+)$", re.IGNORECASE)
 
 
+# The three structural sections carry fixed budgets that sit ON TOP of the user's target
+# word count. The target governs the NARRATIVE only, so adding these sections can never
+# shrink the story — which was the whole point of adding them.
+MANDATORY_SECTION_BUDGETS = (
+    (("BUSINESS AT A GLANCE", "AT A GLANCE"), 600),
+    (("NOTE IN ONE PAGE", "IN ONE PAGE"), 550),
+    (("NUMBERS IN ONE PLACE", "ALL THE NUMBERS"), 700),
+)
+MANDATORY_BUDGET_TOTAL = sum(budget for _keys, budget in MANDATORY_SECTION_BUDGETS)
+
+
+def _mandatory_budget_for(heading: str) -> Optional[int]:
+    """Fixed budget if this heading is one of the structural sections, else None."""
+    upper = (heading or "").upper()
+    for keys, budget in MANDATORY_SECTION_BUDGETS:
+        if any(key in upper for key in keys):
+            return budget
+    return None
+
+
+def _enforce_section_budgets(sections: List[dict], target_word_count: int) -> List[dict]:
+    """Pin the structural sections and guarantee the narrative keeps the full target.
+
+    Runs after outline parsing, so it corrects the planner rather than trusting it:
+    structural sections get their fixed budgets, and if the planner funded them by
+    trimming the narrative, the narrative budgets are scaled back up to the target."""
+    narrative = []
+    for section in sections:
+        fixed = _mandatory_budget_for(section.get("heading", ""))
+        section["mandatory"] = fixed is not None
+        if fixed is not None:
+            section["budget"] = fixed
+        else:
+            narrative.append(section)
+    if not narrative:
+        return sections
+
+    # Narrative sections the planner left without a parseable budget share what is left.
+    missing = [x for x in narrative if x["budget"] <= 0]
+    if missing:
+        assigned = sum(x["budget"] for x in narrative if x["budget"] > 0)
+        remaining = max(target_word_count - assigned, 0)
+        per_missing = remaining // len(missing) if remaining else target_word_count // len(narrative)
+        for x in missing:
+            x["budget"] = max(per_missing, 150)
+
+    # If the planner squeezed the narrative to fit the structural sections inside the
+    # target, scale it back out. Only ever scales UP - an over-budget outline is the
+    # planner deciding the material warrants it, and is left alone.
+    narrative_total = sum(x["budget"] for x in narrative)
+    if 0 < narrative_total < target_word_count * 0.9:
+        factor = target_word_count / float(narrative_total)
+        for x in narrative:
+            x["budget"] = int(round(x["budget"] * factor))
+    return sections
+
+
 def _parse_outline(outline_text) -> List[dict]:
     sections = []
     current = None
@@ -1062,20 +1119,23 @@ def plan_then_write_final(notes_list, filenames, user_prompt, target_word_count,
             snippet += "…"
         status_write(f"⚠️  Outline parsing found 0 sections — falling back to single-pass synthesis. "
                      f"Model output started with: \"{snippet}\"")
-        return _final_reduce(notes_list, filenames, user_prompt, target_word_count, model, status_write)
+        # This path writes the whole document in one call, structural sections included,
+        # so it needs the combined budget - otherwise the narrative gets squeezed to fit.
+        return _final_reduce(notes_list, filenames, user_prompt,
+                             target_word_count + MANDATORY_BUDGET_TOTAL, model, status_write)
 
-    missing_budget = [s for s in sections if s["budget"] <= 0]
-    if missing_budget:
-        already_set = sum(s["budget"] for s in sections if s["budget"] > 0)
-        remaining = max(target_word_count - already_set, 0)
-        per_missing = remaining // len(missing_budget) if remaining else target_word_count // len(sections)
-        for s in missing_budget:
-            s["budget"] = per_missing
+    sections = _enforce_section_budgets(sections, target_word_count)
 
     title, chronology_note = _extract_outline_metadata(outline_text)
-    total_budget = sum(s["budget"] for s in sections)
-    status_write(f"📋 Outline: **{len(sections)} sections**, total budget {total_budget:,} words"
-                 + (f", title: '{title}'" if title else ""))
+    narrative_budget = sum(s["budget"] for s in sections if not s.get("mandatory"))
+    structural_budget = sum(s["budget"] for s in sections if s.get("mandatory"))
+    total_budget = narrative_budget + structural_budget
+    status_write(
+        f"📋 Outline: **{len(sections)} sections** — narrative {narrative_budget:,} words "
+        f"(target {target_word_count:,}) + key-financials/summary/numbers sections "
+        f"{structural_budget:,} words = {total_budget:,} total"
+        + (f", title: '{title}'" if title else "")
+    )
 
     status_write(f"✏️  WRITE stage — generating {len(sections)} sections in parallel…")
     results = [None] * len(sections)
@@ -1520,6 +1580,9 @@ def main():
 
         st.divider()
         st.subheader("Final note length")
+        st.caption("This is the length of the **narrative** sections. The key-financials, "
+                   "one-page-summary and all-the-numbers sections add roughly "
+                   f"{MANDATORY_BUDGET_TOTAL:,} words on top, so they never eat into the story.")
         # Radio rather than a selectbox: this sits low in the sidebar, and a dropdown
         # popup here opens below the fold. All five options fit inline.
         length_choice = st.radio("Target length", list(LENGTH_PRESETS.keys()), index=1)
