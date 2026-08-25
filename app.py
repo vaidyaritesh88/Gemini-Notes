@@ -4,7 +4,8 @@
 
 # --- 1. IMPORTS ---
 import streamlit as st
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import os
 import io
 import json
@@ -166,9 +167,12 @@ iframe {
 
 # --- 2. CONSTANTS & CONFIG ---
 load_dotenv()
+# google-genai client. The legacy google-generativeai SDK was retired on 30 Nov 2025 and
+# cannot reach the Gemini 3.x models, so every call now goes through this client.
+_client = None
 try:
     if "GEMINI_API_KEY" in os.environ and os.environ["GEMINI_API_KEY"]:
-        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+        _client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
     else:
         st.session_state.config_error = "🔴 GEMINI_API_KEY not found."
 except Exception as e:
@@ -183,16 +187,57 @@ CHUNK_WORD_OVERLAP = 400
 # truncates long, detailed notes — especially on later chunks.
 MAX_OUTPUT_TOKENS = 65536
 
+# Live models only, ordered best-quality first — kept in step with SynthNotes-Pro.
+# Removed Aug 2026: gemini-1.5-flash, gemini-1.5-pro, gemini-2.0-flash-lite (all shut
+# down by Google, calls would 404), gemini-3-flash-preview and gemini-3-pro-preview
+# (superseded), gemini-3.1-pro-preview-customtools (not a public model id).
 AVAILABLE_MODELS = {
-    "Gemini 1.5 Flash": "gemini-1.5-flash", "Gemini 1.5 Pro": "gemini-1.5-pro",
-    "Gemini 2.0 Flash": "gemini-2.0-flash-lite", "Gemini 2.5 Flash": "gemini-2.5-flash",
-    "Gemini 2.5 Flash Lite": "gemini-2.5-flash-lite", "Gemini 2.5 Pro": "gemini-2.5-pro",
-    "Gemini 3.0 Flash": "gemini-3-flash-preview", "Gemini 3.0 Pro": "gemini-3-pro-preview",
-    "Gemini 3 Flash Preview": "gemini-3-flash-preview",
-    "Gemini 3 Pro Preview": "gemini-3-pro-preview",
-    "Gemini 3.1 Pro Preview": "gemini-3.1-pro-preview",
-    "Gemini 3.1 Pro Preview (Custom Tools)": "gemini-3.1-pro-preview-customtools",
+    "Gemini 3.1 Pro (Max quality, preview)": "gemini-3.1-pro-preview",
+    "Gemini 3.7 Flash (Best all-round)":     "gemini-3.7-flash",
+    "Gemini 2.5 Pro (Stable, high quality)": "gemini-2.5-pro",
+    "Gemini 2.5 Flash (Fast)":               "gemini-2.5-flash",
+    "Gemini 3.5 Flash Lite (Cheap)":         "gemini-3.5-flash-lite",
+    "Gemini 2.5 Flash Lite (Cheapest)":      "gemini-2.5-flash-lite",
 }
+
+# Model choices are persisted per note in the SQLite database, so saved sessions still
+# carry the old display names. Without this map, every selectbox below would raise
+# ValueError on `.index()` for an existing note and the page would not render.
+LEGACY_MODEL_ALIASES = {
+    "Gemini 1.5 Flash":                      "Gemini 2.5 Flash (Fast)",
+    "Gemini 1.5 Pro":                        "Gemini 2.5 Pro (Stable, high quality)",
+    "Gemini 2.0 Flash":                      "Gemini 2.5 Flash Lite (Cheapest)",
+    "Gemini 2.5 Flash":                      "Gemini 2.5 Flash (Fast)",
+    "Gemini 2.5 Flash Lite":                 "Gemini 2.5 Flash Lite (Cheapest)",
+    "Gemini 2.5 Pro":                        "Gemini 2.5 Pro (Stable, high quality)",
+    "Gemini 3.0 Flash":                      "Gemini 3.7 Flash (Best all-round)",
+    "Gemini 3.0 Pro":                        "Gemini 3.1 Pro (Max quality, preview)",
+    "Gemini 3 Flash Preview":                "Gemini 3.7 Flash (Best all-round)",
+    "Gemini 3 Pro Preview":                  "Gemini 3.1 Pro (Max quality, preview)",
+    "Gemini 3.1 Pro Preview":                "Gemini 3.1 Pro (Max quality, preview)",
+    "Gemini 3.1 Pro Preview (Custom Tools)": "Gemini 3.1 Pro (Max quality, preview)",
+}
+
+# Max-quality defaults, matching SynthNotes-Pro.
+DEFAULT_NOTES_MODEL         = "Gemini 3.1 Pro (Max quality, preview)"
+DEFAULT_REFINEMENT_MODEL    = "Gemini 3.7 Flash (Best all-round)"
+DEFAULT_TRANSCRIPTION_MODEL = "Gemini 3.7 Flash (Best all-round)"
+DEFAULT_CHAT_MODEL          = "Gemini 3.1 Pro (Max quality, preview)"
+
+
+def resolve_model_name(display_name: str, fallback: str = DEFAULT_NOTES_MODEL) -> str:
+    """Map any stored model display name onto one that currently exists."""
+    if display_name in AVAILABLE_MODELS:
+        return display_name
+    mapped = LEGACY_MODEL_ALIASES.get(display_name)
+    if mapped in AVAILABLE_MODELS:
+        return mapped
+    return fallback if fallback in AVAILABLE_MODELS else list(AVAILABLE_MODELS.keys())[0]
+
+
+def model_index(display_name: str, fallback: str = DEFAULT_NOTES_MODEL) -> int:
+    """Selectbox index for a stored model name, never raising on a retired one."""
+    return list(AVAILABLE_MODELS.keys()).index(resolve_model_name(display_name, fallback))
 MEETING_TYPES = ["Expert Meeting", "Earnings Call", "Management Meeting", "Internal Discussion", "Custom"]
 MAX_TOPIC_DISCOVERY_FILES = 4  # Number of PDFs to scan for topic discovery
 EXPERT_MEETING_OPTIONS = ["Option 1: Detailed & Strict", "Option 2: Less Verbose", "Option 3: Less Verbose + Summary"]
@@ -959,10 +1004,10 @@ class AppState:
     selected_note_style: str = "Option 2: Less Verbose"
     earnings_call_mode: str = "Generate New Notes"
     selected_sector: str = "IT Services"
-    notes_model: str = "Gemini 2.5 Pro"
-    refinement_model: str =  "Gemini 2.5 Flash Lite"
-    transcription_model: str =  "Gemini 3.0 Flash"
-    chat_model: str = "Gemini 2.5 Pro"
+    notes_model: str = DEFAULT_NOTES_MODEL
+    refinement_model: str = DEFAULT_REFINEMENT_MODEL
+    transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL
+    chat_model: str = DEFAULT_CHAT_MODEL
     refinement_enabled: bool = True
     add_context_enabled: bool = False
     context_input: str = ""
@@ -1026,8 +1071,9 @@ def stream_and_collect(response, placeholder=None):
     full_text = ""
     update_counter = 0
     for chunk in response:
-        if chunk.parts:
-            full_text += chunk.text
+        piece = getattr(chunk, "text", None)
+        if piece:
+            full_text += piece
             update_counter += 1
             # Throttle UI updates to every 5 chunks to reduce flickering
             if placeholder and update_counter % 5 == 0:
@@ -1228,17 +1274,93 @@ def validate_inputs(state: AppState) -> Optional[str]:
         return "Please provide existing notes for enrichment mode."
     return None
 
-def _get_cached_model(model_display_name: str) -> genai.GenerativeModel:
-    """Return a cached GenerativeModel instance, creating it only if the model name changed."""
+class _StreamHandle:
+    """Iterable wrapper around a google-genai stream.
+
+    The raw stream is a generator, so usage metadata cannot be read back off it after
+    iteration the way the old SDK allowed. This captures it as chunks go past, so
+    safe_get_token_count() still works on the object the caller is holding."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self.usage_metadata = None
+
+    def __iter__(self):
+        for chunk in self._stream:
+            usage = getattr(chunk, "usage_metadata", None)
+            if usage is not None:
+                self.usage_metadata = usage
+            yield chunk
+
+
+def _to_contents(history):
+    """Convert the legacy [{'role':..., 'parts':[str]}] chat history into genai types."""
+    converted = []
+    for message in history or []:
+        parts = message.get("parts") or []
+        if isinstance(parts, str):
+            parts = [parts]
+        converted.append(types.Content(
+            role=message.get("role", "user"),
+            parts=[p if isinstance(p, types.Part) else types.Part(text=str(p)) for p in parts],
+        ))
+    return converted
+
+
+class _ChatHandle:
+    """Adapter exposing the old `chat.send_message(...)` shape on google-genai chats."""
+
+    def __init__(self, chat):
+        self._chat = chat
+
+    def send_message(self, message, stream: bool = False):
+        if isinstance(message, list):
+            message = [p if isinstance(p, str) else str(p) for p in message]
+        if stream:
+            return _StreamHandle(self._chat.send_message_stream(message))
+        return self._chat.send_message(message)
+
+
+class _ModelHandle:
+    """Adapter exposing the old `.generate_content(...)` / `.start_chat(...)` signatures
+    on top of google-genai, so existing call sites did not need rewriting."""
+
+    def __init__(self, model_id: str, system_instruction: str = None):
+        self.model_name = model_id
+        self._system_instruction = system_instruction
+
+    def _config(self, generation_config=None):
+        kwargs = dict(generation_config) if generation_config else {}
+        if self._system_instruction:
+            kwargs["system_instruction"] = self._system_instruction
+        return types.GenerateContentConfig(**kwargs) if kwargs else None
+
+    def generate_content(self, prompt_or_contents, stream: bool = False, generation_config=None):
+        if _client is None:
+            raise RuntimeError("GEMINI_API_KEY is not set - cannot call the Gemini API.")
+        contents = prompt_or_contents if isinstance(prompt_or_contents, list) else [prompt_or_contents]
+        config = self._config(generation_config)
+        if stream:
+            return _StreamHandle(_client.models.generate_content_stream(
+                model=self.model_name, contents=contents, config=config))
+        return _client.models.generate_content(
+            model=self.model_name, contents=contents, config=config)
+
+    def start_chat(self, history=None):
+        if _client is None:
+            raise RuntimeError("GEMINI_API_KEY is not set - cannot call the Gemini API.")
+        return _ChatHandle(_client.chats.create(
+            model=self.model_name, config=self._config(), history=_to_contents(history)))
+
+
+def _get_cached_model(model_display_name: str) -> "_ModelHandle":
+    """Return a cached model handle, creating it only if the model name changed."""
     cache_key = "_model_cache"
     if cache_key not in st.session_state:
         st.session_state[cache_key] = {}
-    # Defensive: handle invalid model names gracefully
-    if model_display_name not in AVAILABLE_MODELS:
-        model_display_name = list(AVAILABLE_MODELS.keys())[0]  # fallback to first model
-    model_id = AVAILABLE_MODELS[model_display_name]
+    model_id = AVAILABLE_MODELS[resolve_model_name(model_display_name)]
     if model_id not in st.session_state[cache_key]:
-        st.session_state[cache_key][model_id] = genai.GenerativeModel(model_id)
+        st.session_state[cache_key][model_id] = _ModelHandle(model_id)
     return st.session_state[cache_key][model_id]
 
 def is_mobile_device() -> bool:
@@ -1369,9 +1491,9 @@ def process_and_save_task(state: AppState, status_ui, progress: ProgressTracker)
                         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_f:
                             chunk.export(temp_f.name, format="wav")
                             local_files.append(temp_f.name)
-                            cloud_ref = genai.upload_file(path=temp_f.name)
+                            cloud_ref = _client.files.upload(file=temp_f.name)
                             cloud_files.append(cloud_ref.name)
-                            while cloud_ref.state.name == "PROCESSING": time.sleep(2); cloud_ref = genai.get_file(cloud_ref.name)
+                            while cloud_ref.state.name == "PROCESSING": time.sleep(2); cloud_ref = _client.files.get(name=cloud_ref.name)
                             if cloud_ref.state.name != "ACTIVE": raise Exception(f"Audio chunk {i+1} cloud processing failed.")
                             response = generate_with_retry(transcription_model, ["Transcribe this audio.", cloud_ref])
                             all_transcripts.append(response.text)
@@ -1383,7 +1505,7 @@ def process_and_save_task(state: AppState, status_ui, progress: ProgressTracker)
             finally:
                 for path in local_files: os.remove(path)
                 for cloud_name in cloud_files:
-                    try: genai.delete_file(cloud_name)
+                    try: _client.files.delete(name=cloud_name)
                     except Exception as e: st.warning(f"Could not delete cloud file {cloud_name}: {e}")
 
         elif file_type is None or file_type.startswith("Error:"):
@@ -1712,10 +1834,10 @@ def render_input_and_processing_tab(state: AppState):
                 if state.add_context_enabled: state.context_input = st.text_area("Context Details:", value=state.context_input, placeholder="e.g., Company Name, Date...")
 
             st.divider()
-            state.notes_model = st.selectbox("Notes Model", list(AVAILABLE_MODELS.keys()), index=list(AVAILABLE_MODELS.keys()).index(state.notes_model))
-            state.refinement_model = st.selectbox("Refinement Model", list(AVAILABLE_MODELS.keys()), index=list(AVAILABLE_MODELS.keys()).index(state.refinement_model))
-            state.transcription_model = st.selectbox("Transcription Model", list(AVAILABLE_MODELS.keys()), index=list(AVAILABLE_MODELS.keys()).index(state.transcription_model), help="Used for audio files.")
-            state.chat_model = st.selectbox("Chat Model", list(AVAILABLE_MODELS.keys()), index=list(AVAILABLE_MODELS.keys()).index(state.chat_model), help="Used for chatting with the final output.")
+            state.notes_model = st.selectbox("Notes Model", list(AVAILABLE_MODELS.keys()), index=model_index(state.notes_model, DEFAULT_NOTES_MODEL))
+            state.refinement_model = st.selectbox("Refinement Model", list(AVAILABLE_MODELS.keys()), index=model_index(state.refinement_model, DEFAULT_REFINEMENT_MODEL))
+            state.transcription_model = st.selectbox("Transcription Model", list(AVAILABLE_MODELS.keys()), index=model_index(state.transcription_model, DEFAULT_TRANSCRIPTION_MODEL), help="Used for audio files.")
+            state.chat_model = st.selectbox("Chat Model", list(AVAILABLE_MODELS.keys()), index=model_index(state.chat_model, DEFAULT_CHAT_MODEL), help="Used for chatting with the final output.")
 
             st.divider()
             st.caption("Browser notifications for processing completion.")
@@ -1822,7 +1944,7 @@ def run_validation_in_chunks(notes: str, transcript: str, model_name: str) -> li
 
     Returns a list of 1 or 2 annotated HTML strings.
     """
-    model = genai.GenerativeModel(model_name)
+    model = _ModelHandle(model_name)
     tx_limit = 40000  # characters of transcript per call
 
     # Find bold question lines — lines that start AND end with ** (markdown bold)
@@ -1996,7 +2118,7 @@ Your generated notes, transcripts, and chat history will appear here.
         if st.button("Validate Output Completeness", key=f"validate_btn_{active_note['id']}", type="secondary", use_container_width=False):
             with st.spinner("Running detailed per-Q&A validation — this may take a moment..."):
                 try:
-                    val_model_name = AVAILABLE_MODELS.get(state.chat_model, "gemini-2.5-pro")
+                    val_model_name = AVAILABLE_MODELS[resolve_model_name(state.chat_model, DEFAULT_CHAT_MODEL)]
                     chunks = run_validation_in_chunks(edited_content, final_transcript, val_model_name)
                     st.session_state[val_key] = chunks
                 except Exception as e:
@@ -2065,8 +2187,8 @@ SOURCE TRANSCRIPT:
 {transcript_context}
 ---
 """
-                chat_model_name = AVAILABLE_MODELS.get(state.chat_model, "gemini-1.5-flash")
-                chat_model = genai.GenerativeModel(chat_model_name, system_instruction=system_prompt)
+                chat_model_name = AVAILABLE_MODELS[resolve_model_name(state.chat_model, DEFAULT_CHAT_MODEL)]
+                chat_model = _ModelHandle(chat_model_name, system_instruction=system_prompt)
                 messages_for_api = [{'role': "model" if m["role"] == "assistant" else "user", 'parts': [m['content']]} for m in st.session_state.chat_histories[active_note['id']]]
 
                 chat = chat_model.start_chat(history=messages_for_api[:-1])
@@ -2075,9 +2197,10 @@ SOURCE TRANSCRIPT:
                 message_placeholder = st.empty()
                 try:
                     for chunk in response:
-                        if not chunk.parts:
+                        piece = getattr(chunk, "text", None)
+                        if not piece:
                             continue
-                        full_response += chunk.text
+                        full_response += piece
                         message_placeholder.markdown(full_response + "\u258c")
                 except Exception as stream_err:
                     # Handle streaming interruption gracefully
@@ -2292,7 +2415,7 @@ def render_ia_processing(state: AppState):
     st.session_state.ia_refine_enabled = ia_enable_refine
     with model_col:
         _ia_model_keys = list(AVAILABLE_MODELS.keys())
-        _ia_model_default = state.notes_model if state.notes_model in AVAILABLE_MODELS else _ia_model_keys[0]
+        _ia_model_default = resolve_model_name(state.notes_model, DEFAULT_NOTES_MODEL)
         ia_model_name = st.selectbox(
             "Model",
             _ia_model_keys,
@@ -3068,7 +3191,7 @@ def render_report_comparison_tab(state: AppState):
     analysis_model = st.selectbox(
         "Model for Dimension Discovery",
         list(AVAILABLE_MODELS.keys()),
-        index=list(AVAILABLE_MODELS.keys()).index(state.notes_model),
+        index=model_index(state.notes_model, DEFAULT_NOTES_MODEL),
         key="rc_analysis_model_select"
     )
 
@@ -3199,7 +3322,7 @@ def render_report_comparison_tab(state: AppState):
     notes_model = st.selectbox(
         "Model for Analysis",
         list(AVAILABLE_MODELS.keys()),
-        index=list(AVAILABLE_MODELS.keys()).index(state.notes_model),
+        index=model_index(state.notes_model, DEFAULT_NOTES_MODEL),
         key="rc_notes_model_select"
     )
 
@@ -3410,7 +3533,7 @@ def render_ec_analysis_tab(state: AppState):
     analysis_model = st.selectbox(
         "Model for Topic Discovery",
         list(AVAILABLE_MODELS.keys()),
-        index=list(AVAILABLE_MODELS.keys()).index(state.notes_model),
+        index=model_index(state.notes_model, DEFAULT_NOTES_MODEL),
         key="ec_analysis_model_select"
     )
 
@@ -3561,7 +3684,7 @@ def render_ec_analysis_tab(state: AppState):
     notes_model = st.selectbox(
         "Model for Notes Generation",
         list(AVAILABLE_MODELS.keys()),
-        index=list(AVAILABLE_MODELS.keys()).index(state.notes_model),
+        index=model_index(state.notes_model, DEFAULT_NOTES_MODEL),
         key="ec_notes_model_select"
     )
 
