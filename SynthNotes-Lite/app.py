@@ -257,6 +257,20 @@ SECTION EXTRACTS:
 
 # ── 3. SAVED PROMPTS HELPERS ──────────────────────────────────────────────────
 
+# ── ffmpeg binary resolution ───────────────────────────────────────────────────
+# Prefer the pip-installed static build over a system package. Streamlit Cloud runs
+# apt-get whenever packages.txt exists, and that step fails outright whenever its base
+# image's Debian mirrors go stale -- taking the whole deployment down for reasons that
+# have nothing to do with this app. A wheel-shipped binary has no such dependency.
+# Falls back to a system ffmpeg when the package is unavailable (local development).
+def _ffmpeg_exe() -> str:
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+
+
 def load_saved_prompts() -> dict:
     """Load saved summary prompts from disk. Returns {'default': str|None, 'prompts': {name: text}}."""
     if os.path.exists(PROMPTS_FILE):
@@ -406,7 +420,7 @@ def extract_pdf_text(file_bytes: bytes) -> str:
 def transcribe_audio(audio_bytes: bytes, model, status_write, context: str = "", file_ext: str = ".audio") -> str:
     """Split audio into 5-min WAV chunks using FFmpeg, upload to Gemini Files API, transcribe.
 
-    Uses FFmpeg (installed via packages.txt) instead of pydub, so it works on any Python version
+    Uses FFmpeg (from the imageio-ffmpeg wheel) instead of pydub, so it works on any Python version
     and handles every audio format FFmpeg supports (WAV, MP3, M4A, OGG, FLAC, WebM, etc.).
 
     context:  optional domain context to improve transcription accuracy
@@ -433,7 +447,7 @@ def transcribe_audio(audio_bytes: bytes, model, status_write, context: str = "",
         chunk_pattern = input_path + "_chunk_%03d.wav"
         subprocess.run(
             [
-                "ffmpeg", "-y", "-i", input_path,
+                _ffmpeg_exe(), "-y", "-i", input_path,
                 "-f", "segment", "-segment_time", "300",
                 "-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1",
                 chunk_pattern,
@@ -448,7 +462,7 @@ def transcribe_audio(audio_bytes: bytes, model, status_write, context: str = "",
         if not chunk_files:
             converted_path = input_path + "_full.wav"
             subprocess.run(
-                ["ffmpeg", "-y", "-i", input_path,
+                [_ffmpeg_exe(), "-y", "-i", input_path,
                  "-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1", converted_path],
                 capture_output=True, timeout=120,
             )

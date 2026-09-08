@@ -144,10 +144,16 @@ Key constants: `CHUNK_WORD_SIZE` 4000, `CHUNK_WORD_OVERLAP` 400, `INTEL_CHUNK_SI
   not the client directly.
 - **Streaming responses are generators.** You cannot set attributes on them; that is what
   `_StreamHandle` is for. Do not "simplify" it away or cost tracking breaks silently.
-- **ffmpeg + ffprobe** are system binaries, declared in the **repo-root** `packages.txt`,
-  not in this folder. Cloud installs system packages only from the repo root. Without
-  them, `_segment_audio()` returns `[]` and transcription falls back to single-shot —
-  degraded, but it will not crash.
+- **ffmpeg comes from a pip wheel, not apt.** `_ffmpeg_exe()` resolves it via
+  `imageio-ffmpeg` (in `requirements.txt`), falling back to a system `ffmpeg`. There is
+  deliberately **no `packages.txt`** in this repo: Streamlit Cloud runs `apt-get` when
+  one exists, and on 2026-09-07 its base image's Debian `bullseye-security` metadata
+  expired, so apt exited non-zero and every deployment in the repo failed to build. Do
+  not reintroduce `packages.txt` — it puts that failure mode back.
+- **There is no ffprobe.** The wheel ships ffmpeg only, so `_audio_duration_seconds()`
+  parses the `Duration:` line from ffmpeg's stderr. ffmpeg exits non-zero when given no
+  output file; that is expected. On failure it returns 0.0 and transcription falls back
+  to single-shot — degraded, but it will not crash.
 - **Root `requirements.txt` pins BOTH SDKs.** `google-genai` for this app,
   `google-generativeai` because the other five apps in this repo still import it. Do not
   remove either.

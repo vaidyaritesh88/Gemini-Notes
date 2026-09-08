@@ -928,16 +928,40 @@ def extract_pdf_text(file_bytes: bytes) -> str:
 
 # ── 7. AUDIO TRANSCRIPTION ─────────────────────────────────────────────────────
 
+# ── ffmpeg binary resolution ───────────────────────────────────────────────────
+# Prefer the pip-installed static build over a system package. Streamlit Cloud runs
+# apt-get whenever packages.txt exists, and that step fails outright whenever its base
+# image's Debian mirrors go stale -- taking the whole deployment down for reasons that
+# have nothing to do with this app. A wheel-shipped binary has no such dependency.
+# Falls back to a system ffmpeg when the package is unavailable (local development).
+def _ffmpeg_exe() -> str:
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+
+
+_FFMPEG_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d\d):(\d\d(?:\.\d+)?)")
+
+
 def _audio_duration_seconds(path: str) -> float:
-    """Duration in seconds via ffprobe. Returns 0.0 if ffprobe is missing or fails,
+    """Duration in seconds, read from ffmpeg's own probe output.
+
+    The pip-installed ffmpeg wheel ships no ffprobe, so this parses the "Duration:"
+    line ffmpeg prints on stderr when handed an input and no output. ffmpeg exits
+    non-zero in that mode, which is expected and ignored. Returns 0.0 on any failure,
     which callers treat as "unknown" and fall back to single-shot transcription."""
     try:
         out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, timeout=60, text=True,
+            [_ffmpeg_exe(), "-i", path],
+            capture_output=True, timeout=60, text=True, errors="replace",
         )
-        return float(out.stdout.strip())
+        match = _FFMPEG_DURATION_RE.search((out.stderr or "") + (out.stdout or ""))
+        if not match:
+            return 0.0
+        hours, minutes, seconds = int(match.group(1)), int(match.group(2)), float(match.group(3))
+        return hours * 3600 + minutes * 60 + seconds
     except Exception:
         return 0.0
 
@@ -962,7 +986,7 @@ def _segment_audio(input_path: str, duration: float,
         seg_path = "%s_seg_%03d.wav" % (input_path, i)
         try:
             subprocess.run(
-                ["ffmpeg", "-y", "-ss", str(start), "-t", str(segment_seconds),
+                [_ffmpeg_exe(), "-y", "-ss", str(start), "-t", str(segment_seconds),
                  "-i", input_path, "-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1", seg_path],
                 capture_output=True, timeout=300,
             )

@@ -21,6 +21,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from enum import Enum
 import re
 import tempfile
+import subprocess
 import html as html_module
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import copy
@@ -28,6 +29,52 @@ import streamlit.components.v1 as components
 
 # --- Local Imports ---
 import database
+
+# ── ffmpeg binary resolution ───────────────────────────────────────────────────
+# Prefer the pip-installed static build over a system package. Streamlit Cloud runs
+# apt-get whenever packages.txt exists, and that step fails outright whenever its base
+# image's Debian mirrors go stale -- taking the whole deployment down for reasons that
+# have nothing to do with this app. A wheel-shipped binary has no such dependency.
+# Falls back to a system ffmpeg when the package is unavailable (local development).
+def _ffmpeg_exe() -> str:
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+
+
+def _load_audio_segment(audio_bytes: bytes):
+    """Decode arbitrary audio bytes into a pydub AudioSegment without needing ffprobe.
+
+    pydub sniffs an unknown format by shelling out to ffprobe, which the pip-installed
+    ffmpeg wheel does not include. Converting to WAV with ffmpeg first means pydub
+    parses the result natively, with no prober involved. Falls back to letting pydub
+    try the original bytes if that conversion fails."""
+    src_path = dst_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".audio") as f:
+            f.write(audio_bytes)
+            src_path = f.name
+        dst_path = src_path + ".wav"
+        subprocess.run(
+            [_ffmpeg_exe(), "-y", "-i", src_path, "-c:a", "pcm_s16le", dst_path],
+            capture_output=True, timeout=600,
+        )
+        if os.path.exists(dst_path) and os.path.getsize(dst_path) > 1024:
+            with open(dst_path, "rb") as fh:
+                return AudioSegment.from_file(io.BytesIO(fh.read()), format="wav")
+    except Exception:
+        pass
+    finally:
+        for path in (src_path, dst_path):
+            if path:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+    return AudioSegment.from_file(io.BytesIO(audio_bytes))
+
 
 # --- App-wide CSS ---
 APP_CSS = """
@@ -1476,7 +1523,7 @@ def process_and_save_task(state: AppState, status_ui, progress: ProgressTracker)
                 audio_bytes = state.uploaded_file.getvalue()
 
             try:
-                audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
+                audio = _load_audio_segment(audio_bytes)
             except Exception as audio_err:
                 raise ValueError(f"Failed to process audio file. It may be corrupted or in an unsupported format. Details: {audio_err}")
 

@@ -2,3 +2,4 @@ google-genai
 streamlit>=1.47.0
 python-dotenv
 pypdf2
+imageio-ffmpeg
