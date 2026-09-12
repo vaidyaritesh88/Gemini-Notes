@@ -639,7 +639,7 @@ def sidebar_common() -> str:
 
 def output_block(text: str, base_name: str, kind: str, key: str, on: Optional[date] = None):
     """Render markdown + copy + downloads for a finished output."""
-    st.markdown(text)
+    st.markdown(text.replace("$", "\$"))   # display only: bare $ pairs render as LaTeX
     st.caption(f"{word_count(text):,} words")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -773,7 +773,6 @@ def page_call():
         st.success("Saved to your downloads: " + ", ".join(f[0] for f in pending))
 
     st.divider()
-    st.subheader(out["title"])
     output_block(out["assembled"], out["title"], "call_writeup", "call", out["when"])
 
     with st.expander("Refine", expanded=False):
