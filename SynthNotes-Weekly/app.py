@@ -639,7 +639,7 @@ def sidebar_common() -> str:
 
 def output_block(text: str, base_name: str, kind: str, key: str, on: Optional[date] = None):
     """Render markdown + copy + downloads for a finished output."""
-    st.markdown(text.replace("$", "\$"))   # display only: bare $ pairs render as LaTeX
+    st.markdown(text.replace("$", "\\$"))   # display only: bare $ pairs render as LaTeX
     st.caption(f"{word_count(text):,} words")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -749,9 +749,9 @@ def page_call():
             st.error(str(e))
             st.stop()
 
-        head = f"**{title.strip()}**\n*{call_type} · {who.strip() or 'n/a'} · {when.strftime('%d %b %Y')}*"
+        head = f"**{title.strip()}**  \n*{call_type} · {who.strip() or 'n/a'} · {when.strftime('%d %b %Y')}*"
         if why.strip():
-            head += f"\n*Context: {why.strip()}*"
+            head += f"  \n*Context: {why.strip()}*"
         assembled = f"{head}\n\n{short}\n\nDetails below:\n\n{detailed}"
         st.session_state["call_out"] = {
             "title": title.strip(), "when": when, "type": call_type, "who": who.strip(),
