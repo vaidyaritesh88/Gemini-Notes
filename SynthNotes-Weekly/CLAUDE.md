@@ -28,12 +28,17 @@ CALL WRITE-UP page
 
 WEEKLY page
   inputs = write-ups sent from the Call page + uploaded files + paste boxes, + framing box
-  [3] WEEKLY     WEEKLY_PROMPT    -> 750-850 words, one bold-titled section per company
+  [3] WEEKLY     WEEKLY_PROMPT    -> 750-850 words. Structure radio: default is ONE combined
+                 write-up organised by topic with sources attributed inside the bullets
+                 (WEEKLY_STRUCTURE_COMBINED); per-company sections are the option for
+                 weeks with unrelated companies (WEEKLY_STRUCTURE_PER_COMPANY)
 ```
 
 Every stage runs `enforce_band()`: if the output is outside its band by more than
 `BAND_TOLERANCE` (8%), one `ADJUST_PROMPT` pass expands or trims it against the source. Bands
-are `DETAILED_BAND`, `SHORT_BAND`, `WEEKLY_BAND`. The band is enforced in code because a word
+are `DETAILED_BAND`, `SHORT_BAND`, `WEEKLY_BAND`. `weekly_budget_block()` turns the weekly
+band into per-component limits (opening / bullets / closing), which the model obeys far
+better than a total; combined mode budgets one section, per-company mode one per call. The band is enforced in code because a word
 count in the instruction alone is not reliably honoured.
 
 `REFINE_PROMPT` powers the Refine box on both pages; it always receives the source of truth

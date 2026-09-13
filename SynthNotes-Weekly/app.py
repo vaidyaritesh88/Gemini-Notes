@@ -200,8 +200,7 @@ DETAILED SECTION (source of truth):
 WEEKLY_PROMPT = """You are writing this week's write-up for the CIO from {n} call write-up(s) produced during the week (below), plus the analyst's framing of the combined learning. Target {lo}-{hi} words in total (a hard ceiling; see the per-component limits below).
 
 **Structure (this is how the analyst writes every week)**
-- One section per company or topic. If all the calls are about the same company or question, one combined section. Section title in bold on its own line, in one of these forms: "**Discussion on X**", "**Checks on X**", "**Meeting with X**", "**X: [what the checks were about]**".
-- Each section: an opening paragraph (who we spoke to and how, a one-to-three sentence business recap if the reader may not follow the company, why we spoke, then the headline learning in two to four sentences, ending with "Details below:" or "Following are the KTAs:"); then 4-8 bullets with bold lead-ins and colons, with sub-bullets for the specifics; then a closing sentence or two on what remains open and what we will do next.
+{structure_block}
 - Where two calls said different things, say so plainly and say which way we lean and why, without strong language ("our checks pointed in a similar direction", "the expert's view differs from management's on this and we will need to do more work").
 - The combined learning across the calls goes in the analyst's voice, hedged, inside the opening or closing paragraphs. Do not add a separate "conclusion" or "summary" section.
 - Budget the words across sections according to how much genuinely new information each call carried, not equally.
@@ -225,6 +224,22 @@ ANALYST'S FRAMING FOR THE WEEK (may be empty):
 CALL WRITE-UPS:
 {calls}
 """
+
+WEEKLY_STRUCTURE_COMBINED = """- Write ONE combined write-up, not one section per call. The calls are treated as one body of checks on the same company or question.
+- One bold title on its own line covering the whole piece, in the analyst's forms: "**Checks on X**", "**Discussion on X**", "**Checks on X and Y**".
+- One opening paragraph: who we spoke to across all the calls (list them briefly: "we spoke with a branch manager, two DSAs and a former zonal head"), a one-to-three sentence recap of the business if the reader may not follow it, why we did these checks, then the combined learning in two to four sentences, ending with "Details below:" or "Key learnings below:".
+- Then bullets organised by TOPIC, never by call. Each bullet brings together what the different sources said on that topic, with attribution inside the bullet ("the branch manager mentioned...", "the DSA felt...", "management claims...", "the former employee's view is..."), and notes where sources agreed or differed. A point made by several sources is stated once with the agreement noted, not repeated per source.
+- Then one closing paragraph on what remains open and what we will do next.
+- Never produce two parallel write-ups stitched together; never repeat the opening or closing per call."""
+
+WEEKLY_STRUCTURE_PER_COMPANY = """- One section per company. Section title in bold on its own line, in one of these forms: "**Discussion on X**", "**Checks on X**", "**Meeting with X**", "**X: [what the checks were about]**".
+- Each section: an opening paragraph (who we spoke to and how, a one-to-three sentence business recap if the reader may not follow the company, why we spoke, then the headline learning in two to four sentences, ending with "Details below:" or "Following are the KTAs:"); then 4-8 bullets with bold lead-ins and colons, with sub-bullets for the specifics; then a closing sentence or two on what remains open and what we will do next.
+- Calls about the same company go into that company's single section, merged by topic with attribution, never as two sub-sections."""
+
+WEEKLY_STRUCTURES = {
+    "One combined write-up (calls on the same company or theme)": WEEKLY_STRUCTURE_COMBINED,
+    "One section per company (calls on unrelated companies)":     WEEKLY_STRUCTURE_PER_COMPANY,
+}
 
 ADJUST_PROMPT = """The text below is {kind}. It is {count} words; it must end up at about {target} words (anywhere between {lo} and {hi} is acceptable). {direction}
 
@@ -334,6 +349,13 @@ def generate(prompt: str, model_display: str, stage: str, placeholder=None,
 def weekly_budget_block(n_sections: int, hi: int) -> str:
     """Per-section limits that sum to the ceiling. Models obey item limits far better
     than a total: '5 bullets of at most 40 words' lands; '850 words total' does not."""
+    if n_sections <= 1:   # one combined write-up
+        opening, closing, n_bul = int(hi * 0.22), int(hi * 0.07), 7
+        bullet = (hi - opening - closing) // n_bul
+        return (f"  - One write-up, at most {hi} words in total.\n"
+                f"  - Opening paragraph at most {opening} words; {n_bul} topic bullets at most {bullet} words "
+                f"each including any sub-bullet; closing at most {closing} words.\n"
+                f"  - Sub-bullets are optional; at most one per bullet.")
     n = max(1, n_sections)
     per = hi // n
     opening = max(60, int(per * 0.30))
@@ -833,6 +855,10 @@ def page_weekly():
         if t.strip():
             pasted.append({"name": f"Pasted {i + 1}", "text": t.strip()})
 
+    structure = st.radio("Structure", list(WEEKLY_STRUCTURES.keys()), index=0, horizontal=False,
+                         help="Default merges every call into one write-up organised by topic, with each "
+                              "source attributed inside the bullets. Pick per-company only when the calls "
+                              "are about unrelated companies.")
     framing = st.text_area(
         "How you want to frame the week (optional)", height=120,
         placeholder=("The combined learning, what to lead with, what to play down, anything the CIO asked about. "
@@ -849,10 +875,12 @@ def page_weekly():
         status = st.status("Writing the weekly…", expanded=True)
         live = st.empty()
         try:
+            combined = structure.startswith("One combined")
             weekly = generate(WEEKLY_PROMPT.format(
                 n=len(calls), lo=WEEKLY_BAND[0], hi=WEEKLY_BAND[1], voice=VOICE_GUIDE,
                 examples=STYLE_EXAMPLES, framing=framing.strip() or "(none given)", calls=joined,
-                budget_block=weekly_budget_block(len(calls), WEEKLY_BAND[1])),
+                structure_block=WEEKLY_STRUCTURES[structure],
+                budget_block=weekly_budget_block(1 if combined else len(calls), WEEKLY_BAND[1])),
                 model, "weekly", live)
             weekly = enforce_band(weekly, WEEKLY_BAND, "the weekly", joined + "\n\nFRAMING:\n" + framing,
                                   model, status.write)
