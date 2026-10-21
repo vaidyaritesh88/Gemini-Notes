@@ -902,7 +902,8 @@ def generate_with_retry(model, prompt, max_retries: int = 3, stream: bool = Fals
             return response
         except Exception as e:
             err = str(e).lower()
-            is_transient = any(k in err for k in ["429", "503", "500", "529", "overloaded", "deadline", "timeout", "unavailable", "resource_exhausted"])
+            is_transient = any(k in err for k in ["429", "503", "500", "529", "overloaded", "deadline", "timeout", "unavailable", "resource_exhausted",
+                                                  "disconnect", "connection", "getaddrinfo", "reset by peer", "temporarily"])
             if is_transient and attempt < max_retries - 1:
                 time.sleep(2 ** (attempt + 1))
                 continue
@@ -1092,7 +1093,16 @@ def transcribe_audio(audio_bytes: bytes, model, status_write, context: str = "",
     local_paths.append(input_path)
 
     def _upload_and_transcribe(path: str, instruction: str) -> str:
-        cloud = _client.files.upload(file=path)
+        # Uploads ride a flaky connection more than anything else (seen: "Server
+        # disconnected without sending a response" on segment 8 of 24), so retry them.
+        for attempt in range(4):
+            try:
+                cloud = _client.files.upload(file=path)
+                break
+            except Exception:
+                if attempt == 3:
+                    raise
+                time.sleep(10 * (attempt + 1))
         cloud_names.append(cloud.name)
         while cloud.state.name == "PROCESSING":
             time.sleep(2)
