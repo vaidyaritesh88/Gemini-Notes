@@ -20,6 +20,9 @@ Rishi Kalia call):**
 - `transcribe_audio`: a segment outside 40-350 words a minute (`SPARSE_` / `RUNAWAY_WORDS_PER_MINUTE`)
   is retried up to `SPARSE_RETRIES` (2) times. Both failures were seen with no error: 17 words for
   5 minutes, and a 3,222-word loop for 4.8 minutes. A real Hinglish call ran at 200-240 words a minute.
+- `transcribe_audio(..., cache_dir=)`: optional per-segment checkpoints (seg_NNN.txt) so a failed run resumes
+  at the failed segment; used by the Call Pipeline. Uploads retry 4 times; generate_with_retry treats
+  disconnects/DNS errors as transient.
 - Tested 21-Oct: no Gemini model reliably transcribes "ICICI ne bhi" (it sounds like "kisi ne bhi");
   2.5 Pro and 3.1 Pro heard "AU" instead, which is worse. 3.7 Flash stays the transcription default.
 

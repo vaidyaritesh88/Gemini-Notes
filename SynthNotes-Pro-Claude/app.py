@@ -1071,7 +1071,11 @@ def _segment_audio(input_path: str, duration: float) -> List[str]:
     return segments
 
 
-def transcribe_audio(audio_bytes: bytes, model, status_write, context: str = "", file_ext: str = ".audio") -> str:
+def transcribe_audio(audio_bytes: bytes, model, status_write, context: str = "", file_ext: str = ".audio",
+                     cache_dir: str = "") -> str:
+    """cache_dir (optional): each finished segment is saved there as seg_NNN.txt and reused
+    on a later call, so a run that fails on segment 8 of 24 resumes at segment 8. Segment
+    boundaries are deterministic, so a cached segment always matches the same audio."""
     base_instruction = (
         "Transcribe this audio completely and accurately, preserving the speaker's words "
         "as closely as possible. Transcribe EVERY sentence spoken - do not summarise, do "
@@ -1136,12 +1140,31 @@ def transcribe_audio(audio_bytes: bytes, model, status_write, context: str = "",
         segments = _segment_audio(input_path, duration) if duration > AUDIO_SEGMENT_SECONDS else []
         local_paths.extend(segments)
 
+        def _cached(i: int) -> str:
+            return os.path.join(cache_dir, "seg_%03d.txt" % i) if cache_dir else ""
+
+        def _save(i: int, text: str) -> None:
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
+                with open(_cached(i), "w", encoding="utf-8") as f:
+                    f.write(text)
+
         # Short clip, or ffmpeg/ffprobe unavailable - send the file as a single piece.
         if not segments:
+            if cache_dir and os.path.exists(_cached(0)):
+                with open(_cached(0), encoding="utf-8") as f:
+                    return f.read().strip()
             status_write("Transcribing audio...")
-            return _upload_and_transcribe(input_path, base_instruction).strip()
+            text = _upload_and_transcribe(input_path, base_instruction).strip()
+            _save(0, text)
+            return text
 
         for i, seg_path in enumerate(segments):
+            if cache_dir and os.path.exists(_cached(i)):
+                with open(_cached(i), encoding="utf-8") as f:
+                    transcripts.append(f.read())
+                status_write("Segment %d of %d already transcribed (resumed)." % (i + 1, len(segments)))
+                continue
             status_write("Transcribing audio segment %d of %d..." % (i + 1, len(segments)))
             if i == 0:
                 instruction = base_instruction
@@ -1163,6 +1186,7 @@ def transcribe_audio(audio_bytes: bytes, model, status_write, context: str = "",
                       "that is not already present in the text above."
                 )
             transcripts.append(_upload_and_transcribe(seg_path, instruction))
+            _save(i, transcripts[-1])
     finally:
         for path in local_paths:
             try:
