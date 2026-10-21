@@ -54,6 +54,12 @@ MAX_AUDIO_MB       = 200
 # Without the overlap every seam can swallow a sentence, and the loss is invisible.
 AUDIO_SEGMENT_SECONDS = 300
 AUDIO_OVERLAP_SECONDS = 20
+# Below this many words per minute of audio, a transcription result is treated as a
+# silent failure and retried (calls run at roughly 100-150 words per minute).
+SPARSE_WORDS_PER_MINUTE = 40
+# Above this, the model has looped and repeated text (a real call measured 200-240 words a minute).
+RUNAWAY_WORDS_PER_MINUTE = 350
+SPARSE_RETRIES = 2
 
 # Text models: every step except transcription. Fable 5.1 is the most capable (and at
 # 2.5x Opus's per-token price, the most expensive); Opus 5.5 is the strong all-rounder.
@@ -330,6 +336,8 @@ Leave this section blank if the notes contain no such views.
 ## QUESTIONS & UNCERTAINTIES THE EXPERT RAISED
 Open questions, unresolved issues, or areas the expert themselves said need further investigation or monitoring. Only include things the expert explicitly flagged — not questions you think are interesting.
 
+**FORMAT: In KEY INSIGHTS, EXPRESSED RISKS & UNCERTAINTIES, STATED NON-CONSENSUS VIEWS and the QUESTIONS section, start every bullet with a short bold headline naming the point, then the statement — e.g. "- **Due-creation LTV is a grey area:** the RBI has not set a cap, so ...". Headlines label; they never add a claim the statement does not make. In HARD DATA & FACTS, start each bullet with a short bold label for the metric.**
+
 ---
 MEETING NOTES:
 {notes}
@@ -377,6 +385,8 @@ Leave this section blank if the notes contain no such views.
 ## QUESTIONS & UNCERTAINTIES MANAGEMENT RAISED
 Open questions, unresolved issues, or areas management themselves said need further work, monitoring, or future visibility. Only include things management explicitly flagged — not questions you think are interesting.
 
+**FORMAT: In KEY INSIGHTS, EXPRESSED RISKS & UNCERTAINTIES, STATED NON-CONSENSUS VIEWS and the QUESTIONS section, start every bullet with a short bold headline naming the point, then the statement — e.g. "- **Due-creation LTV is a grey area:** the RBI has not set a cap, so ...". Headlines label; they never add a claim the statement does not make. In HARD DATA & FACTS, start each bullet with a short bold label for the metric.**
+
 ---
 MEETING NOTES:
 {notes}
@@ -423,6 +433,8 @@ Leave this section blank if the notes contain no such views.
 ## QUESTIONS & UNCERTAINTIES THE TEAM RAISED
 Open questions, items the team deferred, or areas participants themselves said need further work or monitoring. Only include things the team explicitly flagged in the discussion — not questions you think are interesting.
 
+**FORMAT: In KEY INSIGHTS, EXPRESSED RISKS & UNCERTAINTIES, STATED NON-CONSENSUS VIEWS and the QUESTIONS section, start every bullet with a short bold headline naming the point, then the statement — e.g. "- **Due-creation LTV is a grey area:** the RBI has not set a cap, so ...". Headlines label; they never add a claim the statement does not make. In HARD DATA & FACTS, start each bullet with a short bold label for the metric.**
+
 ---
 MEETING NOTES:
 {notes}
@@ -438,6 +450,7 @@ Merge the section extracts by:
 3. Maintaining the same section structure as the input
 4. For Expert Meeting: keeping the best 2–4 direct quotes total
 5. Not adding any information not present in the source extracts
+6. Keeping the bold headline at the start of each bullet, as in the extracts
 
 Output the final unified intelligence brief in the same structured format.
 
@@ -1086,11 +1099,27 @@ def transcribe_audio(audio_bytes: bytes, model, status_write, context: str = "",
             cloud = _client.files.get(name=cloud.name)
         if cloud.state.name != "ACTIVE":
             raise RuntimeError("Audio failed to process in the cloud: %s" % cloud.state.name)
-        resp = generate_with_retry(
-            model, [instruction, cloud], stage="Transcription",
-            generation_config={"max_output_tokens": MAX_OUTPUT_TOKENS},
-        )
-        return resp.text or ""
+        # A transcription call occasionally fails silently in either direction: a few words
+        # for minutes of speech, or a runaway loop repeating text (seen: 3,222 words for
+        # 4.8 minutes). Hinglish calls run at roughly 150-250 words a minute, so a result outside
+        # SPARSE..RUNAWAY_WORDS_PER_MINUTE is retried. If no attempt lands in range, the one
+        # closest to normal speech is kept.
+        minutes = max(_audio_duration_seconds(path), 1.0) / 60
+        attempts = []
+        for attempt in range(SPARSE_RETRIES + 1):
+            resp = generate_with_retry(
+                model, [instruction, cloud], stage="Transcription",
+                generation_config={"max_output_tokens": MAX_OUTPUT_TOKENS},
+            )
+            text = resp.text or ""
+            rate = len(text.split()) / minutes
+            attempts.append((abs(rate - 210), text))
+            if SPARSE_WORDS_PER_MINUTE <= rate <= RUNAWAY_WORDS_PER_MINUTE:
+                return text
+            status_write("Transcript came back %s (%d words for %.1f min); retrying..."
+                         % ("sparse" if rate < SPARSE_WORDS_PER_MINUTE else "too long",
+                            len(text.split()), minutes))
+        return min(attempts, key=lambda a: a[0])[1]
 
     try:
         duration = _audio_duration_seconds(input_path)
@@ -1187,7 +1216,8 @@ def _check_refinement_shrink(raw: str, refined: str) -> str:
     return refined
 
 
-def refine_transcript(raw: str, meeting_type: str, speakers: str, model, status_write) -> str:
+def refine_transcript(raw: str, meeting_type: str, speakers: str, model, status_write,
+                      vocabulary: str = "") -> str:
     lang_instr = (
         "IMPORTANT: Your entire output MUST be in English. "
         "If the transcript contains Hindi, Hinglish, or any other non-English language, "
@@ -1195,6 +1225,18 @@ def refine_transcript(raw: str, meeting_type: str, speakers: str, model, status_
         "meaning. Translate every sentence - never summarise while translating."
     )
     extra = REFINEMENT_INSTRUCTIONS.get(meeting_type, "")
+    if vocabulary.strip():
+        # Names are where speech recognition fails most (a short name like "AU" comes back
+        # garbled or as a different lender). The list lets refinement restore the right
+        # spelling - but only where the transcribed sound clearly matches; it must never
+        # put a name into a sentence that did not contain one.
+        extra += (
+            "\nNAMES AND TERMS LIKELY IN THIS CALL: use this list only to correct a name or term "
+            "that was transcribed with the wrong spelling and clearly sounds like an entry here. "
+            "Never insert a name where none was spoken, and never swap one real name for another. "
+            "Where a name is garbled and you cannot tell which it is, keep the transcribed form "
+            "followed by [?].\n" + vocabulary.strip()
+        )
     speaker_info = "Participants: %s." % speakers if speakers.strip() else ""
     words = raw.split()
 
@@ -1260,8 +1302,16 @@ def refine_transcript(raw: str, meeting_type: str, speakers: str, model, status_
 WRITING_DISCIPLINE = """### **WRITING DISCIPLINE**
 Coverage is settled by the rules above — everything said gets captured. This section
 governs only *how* each captured point is written.
--   **One idea per bullet.** A bullet carrying two ideas should be two bullets. This makes
-    notes longer in line count and shorter in reading time, which is the right trade.
+-   **One point per bullet, written as one full sentence.** A point is a claim together with
+    its own reason, number, example or qualifier — keep those in the same sentence ("Yield
+    rose April–July because unpaid interest was being stepped up into loans"), never split
+    one causal chain across several bullets. Split only where the speaker made genuinely
+    separate points. A bullet of a few words usually means a point was cut in half.
+-   **Fold follow-ups into the question they follow.** When the interviewer asks short
+    clarifying follow-ups on the same topic ("Onboarding is 15?", "How much was it?",
+    "Which ones, banks?"), do not give each its own bold question: put every fact from
+    those answers in the bullets under the question that opened the topic. Start a new bold
+    question only when the subject changes.
 -   **Lead with the substance.** Start each bullet with the point itself, not with
     throat-clearing ("It was noted that...", "The discussion covered...", "They mentioned
     that..."). Cut those openers and keep what follows.

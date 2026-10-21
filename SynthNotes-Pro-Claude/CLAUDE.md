@@ -8,6 +8,21 @@ Deployed as a second Streamlit app from `SynthNotes-Pro-Claude/app.py` in
 `vaidyaritesh88/Gemini-Notes`. Secrets: `ANTHROPIC_API_KEY` (required) and
 `GEMINI_API_KEY` (audio only). Single file: `app.py`, ~2,600 lines.
 
+**Intentional prompt differences from the Gemini app (21-Oct-2026, after comparing both on the
+Rishi Kalia call):**
+- `WRITING_DISCIPLINE`: "one idea per bullet" became "one point per bullet, written as one full
+  sentence" plus "fold follow-ups into the question they follow". Opus took the old rule literally
+  (12-word bullets, 86 headings for a 65-min call vs 45 from Gemini). Coverage rules are untouched.
+- Intelligence prompts: every bullet starts with a bold headline, like the Gemini brief, which
+  scanned better.
+- `refine_transcript(..., vocabulary=)`: an optional names list that refinement may use to fix a
+  misheard name, never to insert one.
+- `transcribe_audio`: a segment outside 40-350 words a minute (`SPARSE_` / `RUNAWAY_WORDS_PER_MINUTE`)
+  is retried up to `SPARSE_RETRIES` (2) times. Both failures were seen with no error: 17 words for
+  5 minutes, and a 3,222-word loop for 4.8 minutes. A real Hinglish call ran at 200-240 words a minute.
+- Tested 21-Oct: no Gemini model reliably transcribes "ICICI ne bhi" (it sounds like "kisi ne bhi");
+  2.5 Pro and 3.1 Pro heard "AU" instead, which is worse. 3.7 Flash stays the transcription default.
+
 **Keep the two apps in step.** A prompt fix in one belongs in the other; diff the two
 `app.py` files — the only intended differences are the CONFIG block, the SDK adapter,
 the transcription selectboxes (`AUDIO_MODELS`), the key check and help/caption text.
