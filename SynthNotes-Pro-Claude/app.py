@@ -1128,7 +1128,9 @@ def transcribe_audio(audio_bytes: bytes, model, status_write, context: str = "",
             text = resp.text or ""
             rate = len(text.split()) / minutes
             attempts.append((abs(rate - 210), text))
-            if SPARSE_WORDS_PER_MINUTE <= rate <= RUNAWAY_WORDS_PER_MINUTE:
+            # A short tail segment (the last few seconds: "thanks, bye") is legitimately sparse.
+            sparse_ok = minutes < 1.0 and rate < SPARSE_WORDS_PER_MINUTE
+            if sparse_ok or SPARSE_WORDS_PER_MINUTE <= rate <= RUNAWAY_WORDS_PER_MINUTE:
                 return text
             status_write("Transcript came back %s (%d words for %.1f min); retrying..."
                          % ("sparse" if rate < SPARSE_WORDS_PER_MINUTE else "too long",
