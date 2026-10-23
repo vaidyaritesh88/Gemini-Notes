@@ -1019,6 +1019,10 @@ def _ffmpeg_exe() -> str:
         return "ffmpeg"
 
 
+# On Windows every ffmpeg call opens a console window - from a background run that is a
+# window flashing up per audio segment. CREATE_NO_WINDOW suppresses it (0 elsewhere).
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 _FFMPEG_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d\d):(\d\d(?:\.\d+)?)")
 
 
@@ -1032,7 +1036,7 @@ def _audio_duration_seconds(path: str) -> float:
     try:
         out = subprocess.run(
             [_ffmpeg_exe(), "-i", path],
-            capture_output=True, timeout=60, text=True, errors="replace",
+            capture_output=True, timeout=60, text=True, errors="replace", creationflags=_NO_WINDOW,
         )
         match = _FFMPEG_DURATION_RE.search((out.stderr or "") + (out.stdout or ""))
         if not match:
@@ -1062,7 +1066,7 @@ def _segment_audio(input_path: str, duration: float) -> List[str]:
             subprocess.run(
                 [_ffmpeg_exe(), "-y", "-ss", str(start), "-t", str(AUDIO_SEGMENT_SECONDS),
                  "-i", input_path, "-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1", seg_path],
-                capture_output=True, timeout=300,
+                capture_output=True, timeout=300, creationflags=_NO_WINDOW,
             )
         except Exception:
             return []

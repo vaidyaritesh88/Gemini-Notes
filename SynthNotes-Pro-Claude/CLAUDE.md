@@ -184,6 +184,8 @@ Key constants: `CHUNK_WORD_SIZE` 4000, `CHUNK_WORD_OVERLAP` 400, `INTEL_CHUNK_SI
   one exists, and on 2026-09-07 its base image's Debian `bullseye-security` metadata
   expired, so apt exited non-zero and every deployment in the repo failed to build. Do
   not reintroduce `packages.txt` — it puts that failure mode back.
+- **ffmpeg runs with `CREATE_NO_WINDOW` on Windows** (`_NO_WINDOW`, 0 elsewhere). Without it every
+  ffmpeg call from the background Call Pipeline flashed a console window on screen (23-Oct-2026).
 - **There is no ffprobe.** The wheel ships ffmpeg only, so `_audio_duration_seconds()`
   parses the `Duration:` line from ffmpeg's stderr. ffmpeg exits non-zero when given no
   output file; that is expected. On failure it returns 0.0 and transcription falls back
