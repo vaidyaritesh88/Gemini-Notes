@@ -143,11 +143,12 @@ Two rules, and they are not in tension. **First: omit nothing.** Every factual c
 
 ### **NOTES STRUCTURE**
 
-**(1.) Opening overview or Expert background (Conditional):**
-- If the transcript chunk begins with an overview, agenda, or expert intro, include it FIRST as bullet points.
+**(1.) Expert background (Conditional):**
+- The notes START with the expert. If the transcript chunk begins with the expert's introduction, or with an overview or agenda that the expert sets out, include it FIRST as bullet points.
 - **DO:** Capture ALL details (names, dates, numbers, titles, affiliations, years of experience, roles). Use simple, direct language.
 - **DO NOT:** Summarize or include introductions about consulting firms.
-- If no intro exists, OMIT this section entirely.
+- **DO NOT include the interviewer side's own introduction.** Leave out whatever the interviewer and their colleagues say to introduce themselves at the start of the call: their names and roles, their firm, where it is based, what it does or invests in, what it is currently working on, their own experience, and the list of topics they say they want to cover. The reader is that firm and already knows all of it. Do not write an "Opening overview" section to hold it. This applies to the introduction only: from the first question onward, the Q&A rules below apply in full.
+- If the expert gives no intro, OMIT this section entirely.
 
 **(2.) Q&A format:**
 Structure the main body STRICTLY in Question/Answer format. If the transcript has no interviewer - a voice note, a dictated memo, or an uninterrupted expert monologue - do not invent questions that were never asked. Instead, turn each distinct topic the speaker covers into a bold heading stating what that passage is about, and capture the substance as the bullets beneath it. The structure is identical; only the source of the headings changes.
@@ -183,10 +184,11 @@ This is a **management meeting**, NOT an expert consultation. Refer to the compa
 ### **NOTES STRUCTURE**
 
 **(1.) Opening overview or Management background (Conditional):**
-- If the transcript chunk begins with an overview, agenda, or management introductions, include it FIRST as bullet points.
+- The notes START with management. If the transcript chunk begins with management's introductions, or with an overview or agenda that management sets out, include it FIRST as bullet points.
 - **DO:** Capture ALL details (names, titles, roles, tenure, prior positions, segments/divisions owned, company background where stated).
 - **DO NOT:** Summarize or include sell-side/broker boilerplate.
-- If no intro exists, OMIT this section entirely.
+- **DO NOT include the analyst side's own introduction.** Leave out whatever the analyst and their colleagues say to introduce themselves at the start of the meeting: their names and roles, their firm, where it is based, what it does or invests in, what it is currently working on, their own experience, and the list of topics they say they want to cover. The reader is that firm and already knows all of it. This applies to the introduction only: from the first question onward, the Q&A rules below apply in full.
+- If management gives no intro or overview, OMIT this section entirely.
 
 **(2.) Q&A format:**
 Structure the main body STRICTLY in Question/Answer format. Most analyst-management meetings ARE Q&A — capture them that way. If the transcript is monologue-style (e.g. prepared management commentary or an opening statement), convert each distinct topic management addresses into a bold question that captures what was at issue, and the substance becomes the bulleted answer below.

@@ -151,6 +151,12 @@ Two rules exist because a specific thing went wrong; do not "simplify" them away
   map-reduce. Stated as a *completeness* standard, never a word count — a length quota is
   satisfiable by padding.
 
+- **Notes start with the expert / management (16-Nov-2026).** Section (1.) of the expert and
+  management prompts leaves out the interviewer side's own introduction (who they are, their
+  firm, what it invests in, the topics they plan to cover). It is a scope rule for the opening
+  only; from the first question on, the Q&A rules apply in full. The internal-discussion prompt
+  is unchanged because it needs participants' names for attribution.
+
 Same reasoning governs `REFINEMENT_FIDELITY_RULE`: refinement may delete verbal noise
 ('um', stutters, false starts) and nothing else. *"Deleting a stutter is fine; deleting a
 restated argument is not."* Refinement rewrites the entire transcript, so anything it
